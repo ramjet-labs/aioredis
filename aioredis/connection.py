@@ -17,7 +17,8 @@ from .errors import (
     ConnectionClosedError,
     RedisError,
     ProtocolError,
-    ReplyError
+    ReplyError,
+    ReadOnlyError,
     )
 from .log import logger
 
@@ -125,6 +126,9 @@ class RedisConnection:
             while True:
                 try:
                     obj = self._parser.gets()
+                    if isinstance(obj, ReplyError):
+                        if obj.args[0].startswith('READONLY'):
+                            obj = ReadOnlyError(obj.args[0])    # index 0?
                 except ProtocolError as exc:
                     # ProtocolError is fatal
                     # so connection must be closed
