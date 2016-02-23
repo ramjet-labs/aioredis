@@ -34,6 +34,7 @@ before_install:
       wget -c https://github.com/antirez/redis/archive/${TAG}.tar.gz -O redis-${TAG}.tar.gz
       tar -xvf redis-${TAG}.tar.gz
       make -C redis-${TAG} PREFIX=$HOME/redis/${TAG} install
+      cp redis-${TAG}/*.conf $HOME/redis/${TAG}/
     done;
   fi
 
@@ -63,7 +64,10 @@ before_script:
 - $REDIS_BIN/redis-cli -p $REDIS_PORT_2 PING
 - export REDIS_VERSION="$(redis-cli -s $REDIS_SOCKET INFO SERVER | sed -n 2p)"
 - echo $REDIS_VERSION
-- $REDIS_BIN/redis-sentinel redis-${REDIS_TAG}/sentinel.conf --daemonize yes
+- >
+  $REDIS_BIN/redis-server redis-${REDIS_TAG}/sentinel.conf
+  --daemonize yes
+  --sentinel
 - sleep 1
 
 script:
