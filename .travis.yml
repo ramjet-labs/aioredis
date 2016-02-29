@@ -68,7 +68,8 @@ before_script:
 - echo $REDIS_VERSION
 - >
   if [ "${SENTINEL}" == "1" ]; then
-    $REDIS_BIN/redis-server $HOME/redis/${REDIS_TAG}/sentinel.conf \
+    echo "port 26379" > /tmp/sentinel.conf;
+    $REDIS_BIN/redis-server /tmp/sentinel.conf \
     --daemonize yes \
     --sentinel;
     redis-cli -p $REDIS_PORT_2 slaveof localhost $REDIS_PORT_1;
