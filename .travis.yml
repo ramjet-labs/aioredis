@@ -11,6 +11,7 @@ env:
   global:
   - REDIS_PORT_1=6379
   - REDIS_PORT_2=6380
+  - SENTINEL_PORT=26379
   - REDIS_SOCKET=/tmp/aioredis.sock
   - ALL_REDIS_TAGS="2.6.17 2.8.22 3.0.5"
   matrix:
@@ -70,9 +71,8 @@ before_script:
     $REDIS_BIN/redis-server $HOME/redis/${REDIS_TAG}/sentinel.conf \
     --daemonize yes \
     --sentinel;
-    redis-cli -p $REDIS_PORT_1 config set slave-read-only yes;
-    redis-cli -p $REDIS_PORT_2 config set slave-read-only yes;
     redis-cli -p $REDIS_PORT_2 slaveof localhost $REDIS_PORT_1;
+    $REDIS_BIN/redis-cli -p $SENTINEL_PORT PING;
   fi;
 - sleep 1
 
@@ -81,6 +81,12 @@ script:
 - python runtests.py --coverage -v
 
 # checking examples
+- >
+  if [ "${SENTINEL}" == "1" ]; then
+    redis-cli -p $SENTINEL_PORT SHUTDOWN;
+    redis-cli -p $REDIS_PORT_1 slaveof no one;
+    redis-cli -p $REDIS_PORT_2 slaveof no one;
+  fi;
 - >
   if python -c "import sys; sys.exit(sys.version_info < (3, 5))"; then
     export EXAMPLES=$(find $PWD/examples/ -name "*.py");
