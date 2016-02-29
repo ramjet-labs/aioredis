@@ -144,26 +144,71 @@ class RedisEncodingTest(BaseTest):
 
 
 class RedisSentinelTest(BaseTest):
+    sentinel_ip = os.environ.get('SENTINEL_IP', 'localhost')
+    sentinel_port = int(os.environ.get('SENTINEL_PORT') or 26379)
+    master_name = os.environ.get("SENTINEL_NAME", 'mymaster')
 
     def setUp(self):
         super().setUp()
-        self.sentinel_ip = os.environ.get('SENTINEL_IP', 'localhost')
-        self.sentinel_port = int(os.environ.get('SENTINEL_PORT', '26379'))
-        self.sentinel_name = os.environ.get("SENTINEL_NAME", 'mymaster')
         self.redis_sentinel = self.loop.run_until_complete(
             self.create_sentinel([(self.sentinel_ip, self.sentinel_port)],
                                  loop=self.loop, encoding='utf-8'))
 
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        loop = asyncio.new_event_loop()
+        run = loop.run_until_complete
+        redis_port = int(os.environ.get("REDIS_PORT") or 6379)
+        redis = run(create_redis(('localhost', 6380), loop=loop))
+        run(redis.slaveof('localhost', redis_port))
+        redis.close()
+        run(redis.wait_closed())
+        sentinel = run(create_connection(
+            (cls.sentinel_ip, cls.sentinel_port), loop=loop))
+        run(sentinel.execute(
+            'sentinel', 'monitor', cls.master_name,
+            '127.0.0.1', redis_port, 1))
+
+        @asyncio.coroutine
+        def wait_master_ready():
+            while True:
+                res = yield from sentinel.execute(
+                    'sentinel', 'masters', encoding='utf-8')
+                for row in res:
+                    it = iter(row)
+                    if dict(zip(it, it))['flags'] == 'master':
+                        return
+
+        @asyncio.coroutine
+        def wait_slave_ready():
+            while True:
+                res = yield from sentinel.execute(
+                    'sentinel', 'slaves', cls.master_name, encoding='utf-8')
+                for row in res:
+                    it = iter(row)
+                    if dict(zip(it, it))['flags'] == 'slave':
+                        return
+
+        run(asyncio.wait_for(
+            asyncio.gather(wait_master_ready(), wait_slave_ready(), loop=loop),
+            20, loop=loop))
+
+        sentinel.close()
+        run(sentinel.wait_closed())
+        loop.close()
+        del loop
+
     @asyncio.coroutine
     def get_master_connection(self):
-        redis = yield from self.redis_sentinel.master_for(self.sentinel_name,
+        redis = yield from self.redis_sentinel.master_for(self.master_name,
                                                           loop=self.loop)
         self._redises.append(redis)
         return redis
 
     @asyncio.coroutine
     def get_slave_connection(self):
-        redis = yield from self.redis_sentinel.slave_for(self.sentinel_name,
+        redis = yield from self.redis_sentinel.slave_for(self.master_name,
                                                          loop=self.loop)
         self._redises.append(redis)
         return redis
@@ -171,3 +216,21 @@ class RedisSentinelTest(BaseTest):
     def tearDown(self):
         del self.redis_sentinel
         super().tearDown()
+
+    @classmethod
+    def tearDownClass(cls):
+        loop = asyncio.new_event_loop()
+        run = loop.run_until_complete
+        redis = run(create_redis(('localhost', 6380), loop=loop))
+        run(redis.slaveof())
+        redis.close()
+        run(redis.wait_closed())
+        sentinel = run(create_connection(
+            ('localhost', int(os.environ.get('SENTINEL_PORT') or 26379)),
+            loop=loop))
+        run(sentinel.execute('sentinel', 'remove', 'mymaster'))
+        sentinel.close()
+        run(sentinel.wait_closed())
+        loop.close()
+        del loop
+        super().tearDownClass()
