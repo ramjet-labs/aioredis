@@ -51,7 +51,6 @@ def run_until_complete(fun_or_timeout):
         return wrapper
 
 
-
 class BaseTest(unittest.TestCase):
     """Base test case for unittests.
     """
