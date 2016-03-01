@@ -160,42 +160,44 @@ class RedisSentinelTest(BaseTest):
         loop = asyncio.new_event_loop()
         run = loop.run_until_complete
         redis_port = int(os.environ.get("REDIS_PORT") or 6379)
-        redis = run(create_redis(('localhost', 6380), loop=loop))
-        run(redis.slaveof('localhost', redis_port))
-        redis.close()
-        run(redis.wait_closed())
-        sentinel = run(create_connection(
-            (cls.sentinel_ip, cls.sentinel_port), loop=loop))
-        run(sentinel.execute(
-            'sentinel', 'monitor', cls.master_name,
-            '127.0.0.1', redis_port, 1))
 
         @asyncio.coroutine
-        def wait_master_ready():
-            while True:
-                res = yield from sentinel.execute(
-                    'sentinel', 'masters', encoding='utf-8')
-                for row in res:
-                    it = iter(row)
-                    if dict(zip(it, it))['flags'] == 'master':
-                        return
+        def setup(loop):
+            sentinel = yield from create_connection(
+                (cls.sentinel_ip, cls.sentinel_port), loop=loop)
+            yield from sentinel.execute(
+                'sentinel', 'monitor', cls.master_name,
+                '127.0.0.1', redis_port, 1)
+            master = yield from create_redis(
+                ('localhost', redis_port), loop=loop)
+            slave = yield from create_redis(
+                ('localhost', 6380), loop=loop)
+            yield from master.config_set('slave-read-only', 'yes')
+            yield from slave.config_set('slave-read-only', 'yes')
+            yield from slave.slaveof('localhost', redis_port)
 
-        @asyncio.coroutine
-        def wait_slave_ready():
-            while True:
-                res = yield from sentinel.execute(
-                    'sentinel', 'slaves', cls.master_name, encoding='utf-8')
-                for row in res:
-                    it = iter(row)
-                    if dict(zip(it, it))['flags'] == 'slave':
-                        return
+            @asyncio.coroutine
+            def wait_ready(word, *args):
+                while True:
+                    res = yield from sentinel.execute(
+                        'sentinel', '{}s'.format(word), *args,
+                        encoding='utf-8')
+                    for row in res:
+                        it = iter(row)
+                        if dict(zip(it, it))['flags'] == word:
+                            return
+            yield from asyncio.wait_for(
+                asyncio.gather(wait_ready('master'),
+                               wait_ready('slave', cls.master_name),
+                               loop=loop),
+                20, loop=loop)
 
-        run(asyncio.wait_for(
-            asyncio.gather(wait_master_ready(), wait_slave_ready(), loop=loop),
-            20, loop=loop))
+            sentinel.close()
+            slave.close()
+            yield from sentinel.wait_closed()
+            yield from slave.wait_closed()
 
-        sentinel.close()
-        run(sentinel.wait_closed())
+        run(asyncio.wait_for(setup(loop), 20, loop=loop))
         loop.close()
         del loop
 
@@ -221,16 +223,29 @@ class RedisSentinelTest(BaseTest):
     def tearDownClass(cls):
         loop = asyncio.new_event_loop()
         run = loop.run_until_complete
-        redis = run(create_redis(('localhost', 6380), loop=loop))
-        run(redis.slaveof())
-        redis.close()
-        run(redis.wait_closed())
-        sentinel = run(create_connection(
-            ('localhost', int(os.environ.get('SENTINEL_PORT') or 26379)),
-            loop=loop))
-        run(sentinel.execute('sentinel', 'remove', 'mymaster'))
-        sentinel.close()
-        run(sentinel.wait_closed())
+
+        @asyncio.coroutine
+        def tear_down(loop):
+            redis_port = int(os.environ.get("REDIS_PORT") or 6379)
+            sentinel = yield from create_connection(
+                (cls.sentinel_ip, cls.sentinel_port), loop=loop)
+            master = yield from create_redis(
+                ('localhost', redis_port), loop=loop)
+            slave = yield from create_redis(
+                ('localhost', 6380), loop=loop)
+            yield from sentinel.execute('sentinel', 'remove', cls.master_name)
+            yield from sentinel.execute('sentinel', 'flushconfig')
+            yield from master.slaveof()
+            yield from slave.slaveof()
+            sentinel.close()
+            master.close()
+            slave.close()
+            yield from asyncio.gather(
+                sentinel.wait_closed(),
+                master.wait_closed(),
+                slave.wait_closed(),
+                loop=loop)
+        run(asyncio.wait_for(tear_down(loop), 20, loop=loop))
         loop.close()
         del loop
         super().tearDownClass()

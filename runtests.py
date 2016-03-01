@@ -41,8 +41,8 @@ assert sys.version >= '3.3', 'Please use Python 3.3 or higher.'
 
 ARGS = argparse.ArgumentParser(description="Run all unittests.")
 ARGS.add_argument(
-    '-v', action="store_true", dest='verbose',
-    default=False, help='verbose')
+    '-v', action="count", dest='verbose',
+    default=0, help='verbose')
 ARGS.add_argument(
     '-x', action="store_true", dest='exclude', help='exclude tests')
 ARGS.add_argument(
@@ -245,7 +245,9 @@ def runtests():
                          verbose=args.verbose)
     logger = logging.getLogger('aioredis')
     logger.addHandler(logging.StreamHandler())
-    if args.verbose:
+    if args.verbose == 1:
+        logger.setLevel(logging.INFO)
+    if args.verbose > 1:
         logger.setLevel(logging.DEBUG)
     else:
         logger.setLevel(logging.CRITICAL)

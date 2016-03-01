@@ -72,14 +72,12 @@ before_script:
     $REDIS_BIN/redis-server /tmp/sentinel.conf \
     --daemonize yes \
     --sentinel;
-    redis-cli -p $REDIS_PORT_2 slaveof localhost $REDIS_PORT_1;
-    $REDIS_BIN/redis-cli -p $SENTINEL_PORT PING;
   fi;
 - sleep 1
 
 script:
 - flake8 aioredis tests
-- python runtests.py --coverage -v
+- python runtests.py --coverage -vv
 
 # checking examples
 - >
