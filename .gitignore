@@ -61,6 +61,11 @@ docs/_build/
 # Vim
 .vim
 tests/ssl
+*.swp
+*.swo
 
 # pyenv
 .python-version
+
+# pytest
+.pytest_cache
