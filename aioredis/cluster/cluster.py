@@ -101,11 +101,27 @@ class ClusterNodesManager:
     REDIS_CLUSTER_HASH_SLOTS = 16384
 
     def __init__(self, nodes):
+        # self.slots will be a dict mapping slot_id -> list of nodes, where the
+        # first node is always the master.
+        self.slots = {}
         nodes = list(nodes)
         masters_slots = {node.id: node.slots for node in nodes}
         for node in nodes:
             if node.is_slave:
                 node.slots = masters_slots[node.master]
+                for slot_rng in node.slots:
+                    for slot in range(slot_rng[0], slot_rng[1] + 1):
+                        if slot in self.slots:
+                            self.slots[slot].append(node)
+                        else:
+                            self.slots[slot] = [node]
+            elif node.is_master:
+                for slot_rng in node.slots:
+                    for slot in range(slot_rng[0], slot_rng[1] + 1):
+                        if slot in self.slots:
+                            self.slots[slot].insert(0, node)
+                        else:
+                            self.slots[slot] = [node]
         self.nodes = nodes
 
     def __repr__(self):
@@ -172,11 +188,12 @@ class ClusterNodesManager:
         return covered_slots_number >= self.REDIS_CLUSTER_HASH_SLOTS
 
     def get_node_by_slot(self, slot):
-        for node in self.masters:
-            if node.in_range(slot):
-                return node
-        else:
+        if slot not in self.slots:
             return None
+        node = self.slots[slot][0]
+        if not node.is_master:
+            return None
+        return node
 
     def get_node_by_id(self, node_id):
         for node in self.nodes:
