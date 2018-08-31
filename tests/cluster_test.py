@@ -1,27 +1,21 @@
 import asyncio
 import functools
-import pytest
-import socket
 import math
-
+import socket
 from unittest import mock
 
-from aioredis import ReplyError, ProtocolError
-from aioredis.commands import ContextRedis
-from aioredis.commands.cluster import (
-    parse_cluster_nodes, parse_cluster_slots, parse_cluster_nodes_lines
-)
-from aioredis.cluster import RedisCluster, RedisPoolCluster
-from aioredis.cluster.testcluster import TestCluster as Cluster
-from aioredis.cluster.cluster import (
-    parse_moved_response_error,
-    ClusterNodesManager,
-    ClusterNode,
-    create_cluster,
-    create_pool_cluster
-)
-from aioredis.errors import RedisClusterError
+import pytest
 
+from aioredis import ProtocolError, ReplyError
+from aioredis.cluster import RedisCluster, RedisPoolCluster
+from aioredis.cluster.cluster import (ClusterNode, ClusterNodesManager, KnownReplyError,
+                                      create_cluster, create_pool_cluster,
+                                      parse_cluster_response_error)
+from aioredis.cluster.testcluster import TestCluster as Cluster
+from aioredis.commands import ContextRedis
+from aioredis.commands.cluster import (parse_cluster_nodes, parse_cluster_nodes_lines,
+                                       parse_cluster_slots)
+from aioredis.errors import RedisClusterError
 
 RAW_SLAVE_INFO_DATA = b"""\
 824fe116063bc5fcf9f4ffd895bc17aee7731ac3 127.0.0.1:30006 slave \
@@ -449,6 +443,15 @@ def nodes(free_ports):
 
 
 @pytest.fixture
+def choice_mock():
+    patcher = mock.patch("random.choice")
+
+    patch = patcher.start()
+    yield patch
+    patcher.stop()
+
+
+@pytest.fixture
 def test_cluster(loop, nodes, cluster_server):
     return loop.run_until_complete(
         create_cluster(nodes, encoding='utf-8', loop=loop)
@@ -512,12 +515,14 @@ cluster_test = pytest.redis_version(
     3, 0, 0, reason='Cluster support was added in version 3')
 
 
-def test_parse_moved_response_error():
-    assert parse_moved_response_error(ReplyError('')) is None
-    assert parse_moved_response_error(ReplyError('ASK')) is None
-    assert parse_moved_response_error(
+def test_parse_cluster_response_error():
+    assert parse_cluster_response_error(ReplyError('')) is None
+    assert parse_cluster_response_error(
+        ReplyError('ASK 3999 127.0.0.1:6381')
+    ) == KnownReplyError(reply="ASK", args=("127.0.0.1", 6381))
+    assert parse_cluster_response_error(
         ReplyError('MOVED 3999 127.0.0.1:6381')
-    ) == ('127.0.0.1', 6381)
+    ) == KnownReplyError(reply="MOVED", args=("127.0.0.1", 6381))
 
 
 def test_nodes_ok_info_parse():
@@ -766,6 +771,123 @@ async def test_execute_with_moved(loop, test_cluster, free_ports):
 
 @cluster_test
 @pytest.mark.run_loop
+async def test_execute_with_ask(loop, test_cluster, free_ports):
+    expected_connections = {
+        free_ports[0]: FakeConnection(
+            free_ports[0],
+            loop,
+            return_value=ReplyError(
+                'ASK 6000 127.0.0.1:{}'.format(free_ports[1])
+            )
+        ),
+        free_ports[1]: FakeConnection(free_ports[1], loop)
+    }
+    with CreateConnectionMock(expected_connections):
+        ok = await test_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+
+    assert ok
+
+    expected_connections[free_ports[0]].execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+    expected_connections[free_ports[1]].execute.assert_has_calls([
+        mock.call(b"ASKING"),
+        mock.call(b'SET', SLOT_ZERO_KEY, 'value'),
+    ])
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_execute_with_tryagain_eventually_raises(loop, test_cluster, free_ports):
+    expected_connections = {
+        free_ports[0]: FakeConnection(
+            free_ports[0],
+            loop,
+            return_value=ReplyError("TRYAGAIN"),
+        ),
+    }
+    with CreateConnectionMock(expected_connections):
+        with pytest.raises(RedisClusterError) as e:
+            await test_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+
+    expected_connections[free_ports[0]].execute.assert_has_calls(
+        [mock.call(b'SET', SLOT_ZERO_KEY, 'value')] * 16
+    )
+    assert "TTL exhausted." in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_execute_with_clusterdown_raises_exception(loop, nodes, cluster_server, free_ports):
+    test_cluster = await create_cluster([nodes[0]], encoding='utf-8', loop=loop)
+    expected_connections = {
+        free_ports[0]: FakeConnection(
+            free_ports[0],
+            loop,
+            return_value=ReplyError("CLUSTERDOWN"),
+        ),
+    }
+    with CreateConnectionMock(expected_connections):
+        with pytest.raises(ReplyError):
+            await test_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+
+    expected_connections[free_ports[0]].execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+    assert test_cluster._refresh_nodes_asap
+    # We should try and re-initialize after this.
+    expected_connections_2 = {
+        free_ports[0]: FakeConnection(
+            free_ports[0],
+            loop,
+            return_value=ReplyError("ERROR"),
+        ),
+    }
+    with CreateConnectionMock(expected_connections_2):
+        with pytest.raises(RedisClusterError) as e:
+            await test_cluster.execute("SET", SLOT_ZERO_KEY, "value")
+
+    assert "No cluster info could be loaded from any host" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_execute_with_connection_error_tries_random_node(loop,
+                                                               choice_mock,
+                                                               test_cluster,
+                                                               free_ports):
+    # Hack random.choice to always return the host at port 7002.
+    def choice_mock_side_effect(seq):
+        sorted_seq = sorted(seq, key=lambda k: k.port)
+        return sorted_seq[2]
+
+    choice_mock.side_effect = choice_mock_side_effect
+    expected_connections = {
+        free_ports[0]: FakeConnection(
+            free_ports[0],
+            loop,
+            return_value=ConnectionError("Uh oh!"),
+        ),
+        free_ports[2]: FakeConnection(
+            free_ports[2],
+            loop,
+        ),
+    }
+
+    with CreateConnectionMock(expected_connections):
+        ok = await test_cluster.execute("SET", SLOT_ZERO_KEY, "value")
+
+    assert ok
+
+    expected_connections[free_ports[0]].execute.assert_called_once_with(
+        b"SET", SLOT_ZERO_KEY, "value"
+    )
+    expected_connections[free_ports[2]].execute.assert_called_once_with(
+        b"SET", SLOT_ZERO_KEY, "value"
+    )
+
+
+@cluster_test
+@pytest.mark.run_loop
 async def test_execute_with_reply_error(loop, test_cluster, free_ports):
     expected_connection = FakeConnection(
         free_ports[0], loop, return_value=ReplyError('ERROR')
@@ -876,23 +998,161 @@ async def test_pool_execute_with_moved(loop, test_pool_cluster, free_ports):
             'MOVED 6000 127.0.0.1:{}'.format(free_ports[1])
         )
     )
-    expected_direct_connection = FakeConnection(free_ports[1], loop)
+    expected_pool_connection_two = FakeConnection(free_ports[1], loop)
 
     with PoolConnectionMock(
-            test_pool_cluster, loop, {free_ports[0]: expected_pool_connection}
+            test_pool_cluster, loop,
+            {
+                free_ports[0]: expected_pool_connection,
+                free_ports[1]: expected_pool_connection_two,
+            }
     ):
-        with CreateConnectionMock(
-                {free_ports[1]: expected_direct_connection}
-        ):
-            ok = await test_pool_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+        ok = await test_pool_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
 
     assert ok
 
     expected_pool_connection.execute.assert_called_once_with(
         b'SET', SLOT_ZERO_KEY, 'value'
     )
-    expected_direct_connection.execute.assert_called_once_with(
+    expected_pool_connection_two.execute.assert_called_once_with(
         b'SET', SLOT_ZERO_KEY, 'value'
+    )
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_execute_with_ask(loop, test_pool_cluster, free_ports):
+    expected_pool_connection = FakeConnection(
+        free_ports[0],
+        loop,
+        return_value=ReplyError(
+            'ASK 6000 127.0.0.1:{}'.format(free_ports[1])
+        )
+    )
+    expected_pool_connection_two = FakeConnection(free_ports[1], loop)
+
+    with PoolConnectionMock(
+            test_pool_cluster, loop,
+            {
+                free_ports[0]: expected_pool_connection,
+                free_ports[1]: expected_pool_connection_two,
+            }
+    ):
+        ok = await test_pool_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+
+    assert ok
+
+    expected_pool_connection.execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+    expected_pool_connection_two.execute.assert_has_calls([
+        mock.call(b'ASKING'),
+        mock.call(b'SET', SLOT_ZERO_KEY, 'value'),
+    ])
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_execute_with_tryagain_eventually_raises(loop, test_pool_cluster, free_ports):
+    expected_pool_connection = FakeConnection(
+        free_ports[0],
+        loop,
+        return_value=ReplyError("TRYAGAIN"),
+    )
+
+    with PoolConnectionMock(
+            test_pool_cluster, loop,
+            {
+                free_ports[0]: expected_pool_connection,
+            }
+    ):
+        with pytest.raises(RedisClusterError) as e:
+            await test_pool_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+
+    expected_pool_connection.execute.assert_has_calls(
+        [mock.call(b'SET', SLOT_ZERO_KEY, 'value')] * 16
+    )
+    assert "TTL exhausted." in str(e)
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_execute_with_clusterdown_raises_exception(
+    loop,
+    nodes,
+    cluster_server,
+    free_ports,
+):
+    test_cluster = await create_pool_cluster([nodes[0]], encoding='utf-8', loop=loop)
+    expected_pool_connection = FakeConnection(
+        free_ports[0],
+        loop,
+        return_value=ReplyError("CLUSTERDOWN"),
+    )
+
+    try:
+        with PoolConnectionMock(test_cluster, loop, {free_ports[0]: expected_pool_connection}):
+            with pytest.raises(ReplyError):
+                await test_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+
+        expected_pool_connection.execute.assert_called_once_with(
+            b'SET', SLOT_ZERO_KEY, 'value'
+        )
+        assert test_cluster._refresh_nodes_asap
+
+        # We should try and re-initialize after this.
+        expected_connections_2 = {
+            free_ports[0]: FakeConnection(
+                free_ports[0],
+                loop,
+                return_value=ReplyError("ERROR"),
+            ),
+        }
+        with CreateConnectionMock(expected_connections_2):
+            with pytest.raises(RedisClusterError) as e:
+                await test_cluster.execute("SET", SLOT_ZERO_KEY, "value")
+
+        assert "No cluster info could be loaded from any host" in str(e)
+    finally:
+        await test_cluster.clear()
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_execute_with_connection_error_tries_random_node(loop,
+                                                                    choice_mock,
+                                                                    test_pool_cluster,
+                                                                    free_ports):
+    # Hack random.choice to always return the host at port 7002.
+    def choice_mock_side_effect(seq):
+        sorted_seq = sorted(seq, key=lambda k: k.port)
+        return sorted_seq[2]
+
+    choice_mock.side_effect = choice_mock_side_effect
+    expected_pool_connection = FakeConnection(
+        free_ports[0],
+        loop,
+        return_value=ConnectionError("Uh oh!"),
+    )
+    expected_pool_connection_2 = FakeConnection(
+        free_ports[2],
+        loop,
+    )
+
+    with PoolConnectionMock(
+            test_pool_cluster, loop,
+            {
+                free_ports[0]: expected_pool_connection,
+                free_ports[2]: expected_pool_connection_2,
+            }
+    ):
+        ok = await test_pool_cluster.execute("SET", SLOT_ZERO_KEY, "value")
+
+    assert ok
+
+    expected_pool_connection.execute.assert_called_once_with(
+        b"SET", SLOT_ZERO_KEY, "value"
+    )
+    expected_pool_connection_2.execute.assert_called_once_with(
+        b"SET", SLOT_ZERO_KEY, "value"
     )
 
 

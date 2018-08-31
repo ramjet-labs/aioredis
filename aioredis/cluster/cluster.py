@@ -1,16 +1,13 @@
 import asyncio
+import collections
 import random
 from functools import partial
 
-from aioredis.commands import (
-    create_redis,
-    Redis,
-    create_redis_pool
-)
-from aioredis.errors import ProtocolError
-from aioredis.errors import ReplyError, RedisClusterError
+from aioredis.commands import Redis, create_redis, create_redis_pool
+from aioredis.errors import ProtocolError, RedisClusterError, ReplyError
 from aioredis.log import logger
-from aioredis.util import decode, encode_str, cached_property
+from aioredis.util import cached_property, decode, encode_str
+
 from .base import RedisClusterBase
 from .crc import crc16
 
@@ -22,17 +19,34 @@ __all__ = (
 )
 
 
-def parse_moved_response_error(err):
+KnownReplyError = collections.namedtuple(
+    "KnownReplyError",
+    ["reply", "args"],
+)
+
+
+
+def parse_cluster_response_error(err):
     if not err or not err.args or not err.args[0]:
-        return
+        return None
     data = err.args[0].strip()
-    if not data.startswith('MOVED'):
-        return
+    if data.startswith("MOVED"):
+        return KnownReplyError(reply="MOVED", args=parse_new_host_response_error(data))
+    elif data.startswith("CLUSTERDOWN"):
+        return KnownReplyError(reply="CLUSTERDOWN", args=None)
+    elif data.startswith("ASK"):
+        return KnownReplyError(reply="ASK", args=parse_new_host_response_error(data))
+    elif data.startswith("TRYAGAIN"):
+        return KnownReplyError(reply="TRYAGAIN", args=None)
+    return None
+
+
+def parse_new_host_response_error(data):
     try:
         host, port = data.split()[-1].split(':')
         return host, int(port)
     except IndexError:
-        return
+        return None
 
 
 class ClusterNode:
@@ -258,6 +272,7 @@ class RedisCluster(RedisClusterBase):
     """Redis cluster."""
 
     MAX_MOVED_COUNT = 10
+    REQUEST_TTL = 16
 
     def __init__(self, nodes, db=0, password=None, encoding=None,
                  *, commands_factory, loop=None):
@@ -271,6 +286,8 @@ class RedisCluster(RedisClusterBase):
         self._loop = loop
         self._moved_count = 0
         self._cluster_manager = None
+        self._initalize_lock = asyncio.Lock()
+        self._refresh_nodes_asap = False
 
     def _is_eval_command(self, command):
         if isinstance(command, bytes):
@@ -402,28 +419,79 @@ class RedisCluster(RedisClusterBase):
           is broken.
         """
         cmd = decode(command, 'utf-8').lower()
-        to_close = []
+        redirect_addr = None
+        asking = False
+        try_random_node = False
+        ttl = int(self.REQUEST_TTL)
+        connections = {}
+
         try:
-            conn = await self.create_connection(address)
-            to_close.append(conn)
-            return await getattr(conn, cmd)(*args, **kwargs)
-        except ReplyError as err:
-            address = parse_moved_response_error(err)
-            if address is None:
-                raise
-            logger.debug('Got MOVED command: {}'.format(err))
-            self._moved_count += 1
-            if self._moved_count >= self.MAX_MOVED_COUNT:
-                await self.initialize()
-                node = self.get_node(command, *args, **kwargs)
-                address = node.address
-            conn = await self.create_connection(address)
-            to_close.append(conn)
-            return await getattr(conn, cmd)(*args, **kwargs)
+            while ttl > 0:
+                ttl -= 1
+                try:
+                    if asking:
+                        if redirect_addr in connections:
+                            conn = connections[redirect_addr]
+                        else:
+                            conn = await self.create_connection(redirect_addr)
+                            connections[redirect_addr] = conn
+                    elif try_random_node:
+                        node = self._cluster_manager.get_random_master_node()
+                        if node.address in connections:
+                            conn = connections[node.address]
+                        else:
+                            conn = await self.create_connection(node.address)
+                            connections[node.address] = conn
+                        try_random_node = False
+                    else:
+                        if address in connections:
+                            conn = connections[address]
+                        else:
+                            conn = await self.create_connection(address)
+                            connections[address] = conn
+
+                    if asking:
+                        await conn.execute(b"ASKING")
+                        asking = False
+
+                    return await getattr(conn, cmd)(*args, **kwargs)
+                except (ConnectionError, asyncio.TimeoutError):
+                    try_random_node = True
+                    if ttl < self.REQUEST_TTL / 2:
+                        await asyncio.sleep(0.1)
+                except ReplyError as err:
+                    parsed_error = parse_cluster_response_error(err)
+                    if parsed_error is None:
+                        raise
+                    if parsed_error.reply == "MOVED":
+                        if parsed_error.args is None:
+                            raise
+                        logger.debug('Got MOVED command: %s', str(err))
+                        address = parsed_error.args
+                        self._moved_count += 1
+                        if self._moved_count >= self.MAX_MOVED_COUNT:
+                            async with self._initalize_lock:
+                                if self._moved_count >= self.MAX_MOVED_COUNT:
+                                    await self.initialize()
+                            node = self.get_node(command, *args, *kwargs)
+                            address = node.address
+                    elif parsed_error.reply == "TRYAGAIN":
+                        if ttl < self.REQUEST_TTL / 2:
+                            await asyncio.sleep(0.05)
+                    elif parsed_error.reply == "ASK":
+                        redirect_addr = parsed_error.args
+                        asking = True
+                    elif parsed_error.reply == "CLUSTERDOWN":
+                        self._refresh_nodes_asap = True
+                        raise
+                    else:
+                        raise
         finally:
-            for conn in to_close:
+            for conn in connections.values():
                 conn.close()
                 await conn.wait_closed()
+
+        raise RedisClusterError("TTL exhausted.")
 
     async def _execute_nodes(self, command, *args, slaves=False, **kwargs):
         """
@@ -467,6 +535,12 @@ class RedisCluster(RedisClusterBase):
                 command, *args, slaves=slaves, **kwargs
             )
 
+        # If requested, we should refresh before doing anything.
+        if self._refresh_nodes_asap:
+            async with self._initalize_lock:
+                if self._refresh_nodes_asap:
+                    await self.initialize()
+                    self._refresh_nodes_asap = False
         if not address:
             address = self.get_node(command, *args, **kwargs).address
 
@@ -553,27 +627,66 @@ class RedisPoolCluster(RedisCluster):
           is broken.
         """
         cmd = decode(command, 'utf-8').lower()
-        try:
-            with await pool as conn:
-                return await getattr(conn, cmd)(*args, **kwargs)
-        except ReplyError as err:
-            address = parse_moved_response_error(err)
-            if address is None:
-                raise
+        redirect_addr = None
+        asking = False
+        try_random_node = False
+        ttl = int(self.REQUEST_TTL)
+        pool_to_use = pool
 
-            logger.debug('Got MOVED command: {}'.format(err))
-            self._moved_count += 1
-            if self._moved_count >= self.MAX_MOVED_COUNT:
-                await self.initialize()
-                pool = self.get_node(command, *args, **kwargs)
-                with await pool as conn:
+        while ttl > 0:
+            ttl -= 1
+
+            try:
+                if asking:
+                    node = self._cluster_manager.get_node_by_address(redirect_addr)
+                    pool_to_use = self._cluster_pool[node.id]
+                elif try_random_node:
+                    node = self._cluster_manager.get_random_master_node()
+                    pool_to_use = self._cluster_pool[node.id]
+                    try_random_node = False
+
+                with await pool_to_use as conn:
+                    if asking:
+                        await conn.execute(b"ASKING")
+                        asking = False
+
                     return await getattr(conn, cmd)(*args, **kwargs)
-            else:
-                conn = await self.create_connection(address)
-                res = await getattr(conn, cmd)(*args, **kwargs)
-                conn.close()
-                await conn.wait_closed()
-                return res
+            except (ConnectionError, asyncio.TimeoutError):
+                try_random_node = True
+                if ttl < self.REQUEST_TTL / 2:
+                    await asyncio.sleep(0.1)
+            except ReplyError as err:
+                parsed_error = parse_cluster_response_error(err)
+                if parsed_error is None:
+                    raise
+                if parsed_error.reply == "MOVED":
+                    if parsed_error.args is None:
+                        raise
+                    logger.debug('Got MOVED command: %s', str(err))
+                    address = parsed_error.args
+                    self._moved_count += 1
+                    if self._moved_count >= self.MAX_MOVED_COUNT:
+                        async with self._initalize_lock:
+                            if self._moved_count >= self.MAX_MOVED_COUNT:
+                                await self.initialize()
+                        pool_to_use = self.get_node(command, *args, *kwargs)
+                    else:
+                        node = self._cluster_manager.get_node_by_address(address)
+                        pool_to_use = self._cluster_pool[node.id]
+
+                elif parsed_error.reply == "TRYAGAIN":
+                    if ttl < self.REQUEST_TTL / 2:
+                        await asyncio.sleep(0.05)
+                elif parsed_error.reply == "ASK":
+                    redirect_addr = parsed_error.args
+                    asking = True
+                elif parsed_error.reply == "CLUSTERDOWN":
+                    self._refresh_nodes_asap = True
+                    raise
+                else:
+                    raise
+
+        raise RedisClusterError("TTL exhausted.")
 
     async def execute(self, command, *args, many=False, **kwargs):
         """Execute redis command and returns Future waiting for the answer.
@@ -589,6 +702,13 @@ class RedisPoolCluster(RedisCluster):
 
         if many:
             return await self._execute_nodes(command, *args, **kwargs)
+
+        # If requested, we should refresh before doing anything.
+        if self._refresh_nodes_asap:
+            async with self._initalize_lock:
+                if self._refresh_nodes_asap:
+                    await self.initialize()
+                    self._refresh_nodes_asap = False
 
         pool = self.get_node(command, *args, **kwargs)
         return await self._execute_node(pool, command, *args, **kwargs)
