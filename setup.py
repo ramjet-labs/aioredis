@@ -1,9 +1,9 @@
-import re
 import os.path
-import sys
 import platform
-from setuptools import setup, find_packages
+import re
+import sys
 
+from setuptools import find_packages, setup
 
 install_requires = ['async-timeout']
 if platform.python_implementation() == 'CPython':
@@ -21,7 +21,7 @@ def read(*parts):
 
 
 def read_version():
-    regexp = re.compile(r"^__version__\W*=\W*'([\d.abrc]+)'")
+    regexp = re.compile(r"^__version__\W*=\W*'([\d.\-a-z]+)'")
     init_py = os.path.join(os.path.dirname(__file__),
                            'aioredis', '__init__.py')
     with open(init_py) as f:
