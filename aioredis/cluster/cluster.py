@@ -351,7 +351,7 @@ class RedisCluster(RedisClusterBase):
             await conn.wait_closed()
 
     async def fetch_cluster_info(self):
-        logger.info('Loading cluster info from {}...'.format(self._nodes))
+        logger.debug('Loading cluster info from %s...', self._nodes)
         tasks = [
             asyncio.ensure_future(
                 self._get_raw_cluster_info_from_node(node), loop=self._loop
@@ -364,8 +364,8 @@ class RedisCluster(RedisClusterBase):
                     self._cluster_manager = ClusterNodesManager.create(
                         nodes_raw_response
                     )
-                    logger.info('Cluster info loaded successfully: %s',
-                                nodes_raw_response)
+                    logger.debug('Cluster info loaded successfully: %s',
+                                  nodes_raw_response)
                     return
                 except (ReplyError, ProtocolError,
                         ConnectionError, OSError) as exc:
@@ -384,10 +384,10 @@ class RedisCluster(RedisClusterBase):
             "No cluster info could be loaded from any host")
 
     async def initialize(self):
-        logger.info('Initializing cluster...')
+        logger.debug('Initializing cluster...')
         self._moved_count = 0
         await self.fetch_cluster_info()
-        logger.info('Initialized cluster.\n{}'.format(self._cluster_manager))
+        logger.debug('Initialized cluster.\n%s', self._cluster_manager)
 
     async def clear(self):
         pass  # All connections are created on demand and destroyed afterwards.
@@ -593,13 +593,13 @@ class RedisPoolCluster(RedisCluster):
         return cluster_pool
 
     async def reload_cluster_pool(self):
-        logger.info('Reloading cluster...')
+        logger.debug('Reloading cluster...')
         await self.clear()
         self._moved_count = 0
         await self.fetch_cluster_info()
-        logger.info('Connecting to cluster...')
+        logger.debug('Connecting to cluster...')
         self._cluster_pool = await self.get_cluster_pool()
-        logger.info('Reloaded cluster')
+        logger.debug('Reloaded cluster')
 
     async def initialize(self):
         await super().initialize()
