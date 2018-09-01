@@ -3,6 +3,7 @@ import collections
 import random
 from functools import partial
 
+from aioredis.abc import AbcPool
 from aioredis.commands import Redis, create_redis, create_redis_pool
 from aioredis.errors import ProtocolError, RedisClusterError, ReplyError
 from aioredis.log import logger
@@ -424,6 +425,19 @@ class RedisCluster(RedisClusterBase):
         )
         return conn
 
+    async def get_conn_context_for_node(self, node):
+        redis = await self.create_connection(node.address)
+        return ClusterConnectionContext(redis)
+
+    async def get_conn_context_for_slot(self, slot):
+        node = self._cluster_manager.get_node_by_slot(slot)
+        if not node or not node.is_master:
+            raise RedisClusterError(
+                "No master available for slot {}!".format(slot)
+            )
+        redis = await self.create_connection(node.address)
+        return ClusterConnectionContext(redis)
+
     async def _execute_node(self, address, command, *args, **kwargs):
         """Execute redis command and returns Future waiting for the answer.
 
@@ -632,6 +646,17 @@ class RedisPoolCluster(RedisCluster):
         node = super().get_node(command, *args, **kwargs)
         return self._cluster_pool[node.id]
 
+    async def get_conn_context_for_node(self, node):
+        return ClusterConnectionContext(self._cluster_pool[node.id])
+
+    async def get_conn_context_for_slot(self, slot):
+        node = self._cluster_manager.get_node_by_slot(slot)
+        if not node or not node.is_master:
+            raise RedisClusterError(
+                "No master available for slot {}!".format(slot)
+            )
+        return ClusterConnectionContext(self._cluster_pool[node.id])
+
     async def _execute_node(self, pool, command, *args, **kwargs):
         """Execute redis command and returns Future waiting for the answer.
 
@@ -729,3 +754,30 @@ class RedisPoolCluster(RedisCluster):
 
         pool = self.get_node(command, *args, **kwargs)
         return await self._execute_node(pool, command, *args, **kwargs)
+
+
+class ClusterConnectionContext(object):
+    """
+    Meant to be an easy way to acquire an individual connection to a specific
+    node in a cluster. Will take care of closing the connection or releasing it
+    back into the pool (depending on what type of cluster it is).
+    """
+
+    def __init__(self, redis):
+        self._redis = redis
+        self._redis_context = None
+
+    async def __aenter__(self):
+        self._redis_context = await self._redis
+        return self._redis_context
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if not self._redis_context:
+            return
+        if isinstance(self._redis.connection, AbcPool):
+            # This is a hacky way to force release the connection.
+            with self._redis_context as conn:
+                pass
+        else:
+            self._redis.close()
+            await self._redis.wait_closed()

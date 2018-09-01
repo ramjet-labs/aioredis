@@ -8,12 +8,14 @@ import pytest
 
 from aioredis import ProtocolError, ReplyError
 from aioredis.cluster import RedisCluster, RedisPoolCluster
-from aioredis.cluster.cluster import (ClusterNode, ClusterNodesManager, KnownReplyError,
-                                      create_cluster, create_pool_cluster,
+from aioredis.cluster.cluster import (ClusterNode, ClusterNodesManager,
+                                      KnownReplyError, create_cluster,
+                                      create_pool_cluster,
                                       parse_cluster_response_error)
 from aioredis.cluster.testcluster import TestCluster as Cluster
 from aioredis.commands import ContextRedis
-from aioredis.commands.cluster import (parse_cluster_nodes, parse_cluster_nodes_lines,
+from aioredis.commands.cluster import (parse_cluster_nodes,
+                                       parse_cluster_nodes_lines,
                                        parse_cluster_slots)
 from aioredis.errors import RedisClusterError
 
@@ -952,6 +954,52 @@ async def test_execute_command(loop, test_cluster, free_ports):
 
 @cluster_test
 @pytest.mark.run_loop
+async def test_conn_context_given_node(loop, test_cluster, free_ports):
+    expected_connection = FakeConnection(free_ports[0], loop)
+    with CreateConnectionMock({free_ports[0]: expected_connection}):
+        first_node = next(
+            node for node in test_cluster.master_nodes
+            if node.port == free_ports[0]
+        )
+        conn_context = await test_cluster.get_conn_context_for_node(first_node)
+        async with conn_context as conn:
+            ok = await conn.set(SLOT_ZERO_KEY, 'value')
+
+    assert ok
+
+    expected_connection.execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_conn_context_given_slot(loop, test_cluster, free_ports):
+    expected_connection = FakeConnection(free_ports[0], loop)
+    with CreateConnectionMock({free_ports[0]: expected_connection}):
+        conn_context = await test_cluster.get_conn_context_for_slot(0)
+        async with conn_context as conn:
+            ok = await conn.set(SLOT_ZERO_KEY, 'value')
+
+    assert ok
+
+    expected_connection.execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_conn_context_raises_error(loop, test_cluster, free_ports):
+    with CreateConnectionMock({}):
+        with pytest.raises(RedisClusterError) as e:
+            await test_cluster.get_conn_context_for_slot(20000)
+
+    assert "No master available for slot 20000!" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
 async def test_create_pool(test_pool_cluster):
     assert isinstance(test_pool_cluster, RedisPoolCluster)
 
@@ -1242,6 +1290,67 @@ async def test_reload_cluster_pool(test_pool_cluster):
         id(pool) for pool in old_pools
     }.isdisjoint({id(pool) for pool in new_pools})
     await test_pool_cluster.clear()
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_conn_context_given_node(loop, test_pool_cluster, free_ports):
+    expected_connection = FakeConnection(free_ports[0], loop)
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        {free_ports[0]: expected_connection},
+    ):
+        first_node = next(
+            node for node in test_pool_cluster.master_nodes
+            if node.port == free_ports[0]
+        )
+        conn_context = await test_pool_cluster.get_conn_context_for_node(
+            first_node
+        )
+        async with conn_context as conn:
+            ok = await conn.set(SLOT_ZERO_KEY, 'value')
+
+    assert ok
+
+    expected_connection.execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_conn_context_given_slot(loop, test_pool_cluster, free_ports):
+    expected_connection = FakeConnection(free_ports[0], loop)
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        {free_ports[0]: expected_connection},
+    ):
+        conn_context = await test_pool_cluster.get_conn_context_for_slot(0)
+        async with conn_context as conn:
+            ok = await conn.set(SLOT_ZERO_KEY, 'value')
+
+    assert ok
+
+    expected_connection.execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_conn_context_raises_error(loop, test_pool_cluster):
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        {},
+    ):
+        with pytest.raises(RedisClusterError) as e:
+            await test_pool_cluster.get_conn_context_for_slot(20000)
+
+    assert "No master available for slot 20000!" in str(e)
+
 
 
 @cluster_test
