@@ -642,10 +642,6 @@ class RedisPoolCluster(RedisCluster):
             pool.close()
             await pool.wait_closed()
 
-    def get_node(self, command, *args, **kwargs):
-        node = super().get_node(command, *args, **kwargs)
-        return self._cluster_pool[node.id]
-
     async def get_conn_context_for_node(self, node):
         return ClusterConnectionContext(self._cluster_pool[node.id])
 
@@ -711,7 +707,8 @@ class RedisPoolCluster(RedisCluster):
                         async with self._initalize_lock:
                             if self._moved_count >= self.MAX_MOVED_COUNT:
                                 await self.initialize()
-                        pool_to_use = self.get_node(command, *args, *kwargs)
+                        node = self.get_node(command, *args, *kwargs)
+                        pool_to_use = self._cluster_pool[node.id]
                     else:
                         node = self._cluster_manager.get_node_by_address(address)
                         pool_to_use = self._cluster_pool[node.id]
@@ -752,7 +749,8 @@ class RedisPoolCluster(RedisCluster):
                     await self.initialize()
                     self._refresh_nodes_asap = False
 
-        pool = self.get_node(command, *args, **kwargs)
+        node = self.get_node(command, *args, **kwargs)
+        pool = self._cluster_pool[node.id]
         return await self._execute_node(pool, command, *args, **kwargs)
 
 

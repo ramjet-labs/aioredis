@@ -1010,14 +1010,14 @@ async def test_create_pool(test_pool_cluster):
 @cluster_test
 @pytest.mark.run_loop
 async def test_cluster_pool_get_node(test_pool_cluster, free_ports):
-    pool = test_pool_cluster.get_node('GET', 'key:0')
-    assert pool.address[1] == free_ports[0]
+    node = test_pool_cluster.get_node('GET', 'key:0')
+    assert node.address[1] == free_ports[0]
 
-    pool = test_pool_cluster.get_node('GET', b'key:1')
-    assert pool.address[1] == free_ports[1]
+    node = test_pool_cluster.get_node('GET', b'key:1')
+    assert node.address[1] == free_ports[1]
 
-    pool = test_pool_cluster.get_node('GET', b'key:3', 'more', 'args')
-    assert pool.address[1] == free_ports[2]
+    node = test_pool_cluster.get_node('GET', b'key:3', 'more', 'args')
+    assert node.address[1] == free_ports[2]
 
 
 @cluster_test
