@@ -11,6 +11,7 @@ from aioredis.util import cached_property, decode, encode_str
 
 from .base import RedisClusterBase
 from .crc import crc16
+from .transaction import ClusterTransactionsMixin
 
 __all__ = (
     'create_pool_cluster',
@@ -286,7 +287,7 @@ async def create_cluster(
     return cluster
 
 
-class RedisCluster(RedisClusterBase):
+class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
     """Redis cluster."""
 
     MAX_MOVED_COUNT = 10
@@ -581,7 +582,7 @@ class RedisCluster(RedisClusterBase):
         return partial(self.execute, cmd)
 
 
-class RedisPoolCluster(RedisCluster):
+class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
     """
     Redis pool cluster.
     Do not use it for cluster management.

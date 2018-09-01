@@ -13,11 +13,12 @@ from aioredis.cluster.cluster import (ClusterNode, ClusterNodesManager,
                                       create_pool_cluster,
                                       parse_cluster_response_error)
 from aioredis.cluster.testcluster import TestCluster as Cluster
+from aioredis.cluster.transaction import InvalidPipelineOperation
 from aioredis.commands import ContextRedis
 from aioredis.commands.cluster import (parse_cluster_nodes,
                                        parse_cluster_nodes_lines,
                                        parse_cluster_slots)
-from aioredis.errors import RedisClusterError
+from aioredis.errors import PipelineError, RedisClusterError
 
 RAW_SLAVE_INFO_DATA = b"""\
 824fe116063bc5fcf9f4ffd895bc17aee7731ac3 127.0.0.1:30006 slave \
@@ -1872,3 +1873,194 @@ async def test_multi_key_commands_on_cluster(test_cluster):
 
     assert await test_cluster.get('my{key}') is None
     assert await test_cluster.get('other{key}') is None
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pipeline_executes_on_multiple_keys(loop, test_cluster):
+    pipeline = test_cluster.pipeline()
+    fut1 = pipeline.set("{test}key", "testval")
+    fut2 = pipeline.set("{test}key2", "testval2")
+    fut3 = pipeline.hset("{test}key3", "testfield3", "testval3")
+
+    result = await pipeline.execute()
+    result_check = await asyncio.gather(fut1, fut2, fut3, loop=loop)
+    assert result == result_check
+
+    assert result == [True, True, True]
+
+    assert (await test_cluster.get("{test}key")) == "testval"
+    assert (await test_cluster.get("{test}key2")) == "testval2"
+    assert (await test_cluster.hget("{test}key3", "testfield3")) == "testval3"
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_cant_execute_pipeline_twice(loop, test_cluster):
+    pipeline = test_cluster.pipeline()
+    fut1 = pipeline.set("{test}key", "testval")
+    fut2 = pipeline.set("{test}key2", "testval2")
+    fut3 = pipeline.hset("{test}key3", "testfield3", "testval3")
+
+    result = await pipeline.execute()
+    result_check = await asyncio.gather(fut1, fut2, fut3, loop=loop)
+    assert result == result_check
+
+    assert result == [True, True, True]
+
+    with pytest.raises(AssertionError) as e:
+        await pipeline.execute()
+
+    assert "Pipeline already executed. Create new one." in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pipeline_raises_and_cancels_futures_with_diff_nodes(loop,
+                                                                   test_cluster):
+    pipeline = test_cluster.pipeline()
+    fut1 = pipeline.set("{test}key", "testval")
+    with pytest.raises(InvalidPipelineOperation) as e:
+        pipeline.set("key2", "testval2")
+
+    try:
+        await asyncio.gather(fut1, loop=loop)
+    except asyncio.CancelledError:
+        pass
+    assert fut1.cancelled()
+    for fut, _, _, _ in pipeline._pipeline:
+        assert fut.cancelled()
+
+    assert pipeline._done
+
+    assert "All keys in pipeline must point to same node!" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pipeline_raises_errors_from_individual_operations(loop,
+                                                                 test_cluster,
+                                                                 free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("UH OH!")
+    )
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+    with CreateConnectionMock({free_ports[0]: expected_connection}):
+        pipeline = test_cluster.pipeline()
+        fut1 = pipeline.set(SLOT_ZERO_KEY, "testval")
+        fut2 = pipeline.set(second_key, "testval2")
+        # This is a generic pipeline error.
+        with pytest.raises(PipelineError):
+            await pipeline.execute()
+
+        # This is the specific error from the connection.
+        with pytest.raises(ReplyError) as e:
+            await asyncio.gather(fut1, fut2, loop=loop)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    assert "UH OH!" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_pipeline_executes_on_multiple_keys(loop, test_pool_cluster):
+    pipeline = test_pool_cluster.pipeline()
+    fut1 = pipeline.set("{test}key", "testval")
+    fut2 = pipeline.set("{test}key2", "testval2")
+    fut3 = pipeline.hset("{test}key3", "testfield3", "testval3")
+
+    result = await pipeline.execute()
+    result_check = await asyncio.gather(fut1, fut2, fut3, loop=loop)
+    assert result == result_check
+
+    assert result == [True, True, True]
+
+    assert (await test_pool_cluster.get("{test}key")) == "testval"
+    assert (await test_pool_cluster.get("{test}key2")) == "testval2"
+    assert (await test_pool_cluster.hget("{test}key3", "testfield3")) == \
+        "testval3"
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_cant_execute_pipeline_twice(loop, test_pool_cluster):
+    pipeline = test_pool_cluster.pipeline()
+    fut1 = pipeline.set("{test}key", "testval")
+    fut2 = pipeline.set("{test}key2", "testval2")
+    fut3 = pipeline.hset("{test}key3", "testfield3", "testval3")
+
+    result = await pipeline.execute()
+    result_check = await asyncio.gather(fut1, fut2, fut3, loop=loop)
+    assert result == result_check
+
+    assert result == [True, True, True]
+
+    with pytest.raises(AssertionError) as e:
+        await pipeline.execute()
+
+    assert "Pipeline already executed. Create new one." in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_pipeline_raises_and_cancels_futures_with_diff_nodes(
+    loop,
+    test_pool_cluster
+):
+    pipeline = test_pool_cluster.pipeline()
+    fut1 = pipeline.set("{test}key", "testval")
+    with pytest.raises(InvalidPipelineOperation) as e:
+        pipeline.set("key2", "testval2")
+
+    try:
+        await asyncio.gather(fut1, loop=loop)
+    except asyncio.CancelledError:
+        pass
+    assert fut1.cancelled()
+    for fut, _, _, _ in pipeline._pipeline:
+        assert fut.cancelled()
+
+    assert pipeline._done
+
+    assert "All keys in pipeline must point to same node!" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_pipeline_raises_errors_from_individual_operations(
+    loop,
+    test_pool_cluster,
+    free_ports,
+):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("UH OH!")
+    )
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        {free_ports[0]: expected_connection},
+    ):
+        pipeline = test_pool_cluster.pipeline()
+        fut1 = pipeline.set(SLOT_ZERO_KEY, "testval")
+        fut2 = pipeline.set(second_key, "testval2")
+        # This is a generic pipeline error.
+        with pytest.raises(PipelineError):
+            await pipeline.execute()
+
+        # This is the specific error from the connection.
+        with pytest.raises(ReplyError) as e:
+            await asyncio.gather(fut1, fut2, loop=loop)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    assert "UH OH!" in str(e)
