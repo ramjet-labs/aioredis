@@ -439,7 +439,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
         redis = await self.create_connection(node.address)
         return ClusterConnectionContext(redis)
 
-    async def _execute_node(self, address, command, *args, **kwargs):
+    async def _execute_node(self, address, command, *args, asking=False, **kwargs):
         """Execute redis command and returns Future waiting for the answer.
 
         :param command str
@@ -451,8 +451,6 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
           is broken.
         """
         cmd = decode(command, 'utf-8').lower()
-        redirect_addr = None
-        asking = False
         try_random_node = False
         ttl = int(self.REQUEST_TTL)
         connections = {}
@@ -462,11 +460,11 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
                 ttl -= 1
                 try:
                     if asking:
-                        if redirect_addr in connections:
-                            conn = connections[redirect_addr]
+                        if address in connections:
+                            conn = connections[address]
                         else:
-                            conn = await self.create_connection(redirect_addr)
-                            connections[redirect_addr] = conn
+                            conn = await self.create_connection(address)
+                            connections[address] = conn
                     elif try_random_node:
                         node = self._cluster_manager.get_random_master_node()
                         if node.address in connections:
@@ -511,7 +509,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
                         if ttl < self.REQUEST_TTL / 2:
                             await asyncio.sleep(0.05)
                     elif parsed_error.reply == "ASK":
-                        redirect_addr = parsed_error.args
+                        address = parsed_error.args
                         asking = True
                     elif parsed_error.reply == "CLUSTERDOWN":
                         self._refresh_nodes_asap = True
@@ -654,7 +652,13 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             )
         return ClusterConnectionContext(self._cluster_pool[node.id])
 
-    async def _execute_node(self, pool, command, *args, **kwargs):
+    async def _execute_node(self,
+                            pool,
+                            command,
+                            *args,
+                            address=None,
+                            asking=False,
+                            **kwargs):
         """Execute redis command and returns Future waiting for the answer.
 
         :param command str
@@ -666,8 +670,6 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
           is broken.
         """
         cmd = decode(command, 'utf-8').lower()
-        redirect_addr = None
-        asking = False
         try_random_node = False
         ttl = int(self.REQUEST_TTL)
         pool_to_use = pool
@@ -677,7 +679,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
 
             try:
                 if asking:
-                    node = self._cluster_manager.get_node_by_address(redirect_addr)
+                    node = self._cluster_manager.get_node_by_address(address)
                     pool_to_use = self._cluster_pool[node.id]
                 elif try_random_node:
                     node = self._cluster_manager.get_random_master_node()
@@ -718,7 +720,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                     if ttl < self.REQUEST_TTL / 2:
                         await asyncio.sleep(0.05)
                 elif parsed_error.reply == "ASK":
-                    redirect_addr = parsed_error.args
+                    address = parsed_error.args
                     asking = True
                 elif parsed_error.reply == "CLUSTERDOWN":
                     self._refresh_nodes_asap = True
