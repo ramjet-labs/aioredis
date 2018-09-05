@@ -1,7 +1,8 @@
 import asyncio
 import functools
 
-from ..errors import PipelineError, RedisError
+from ..errors import PipelineError, RedisError, ReplyError
+from .util import parse_cluster_response_error
 
 
 class InvalidPipelineOperation(RedisError):
@@ -93,6 +94,7 @@ class ClusterPipeline(object):
             @functools.wraps(attr)
             def wrapper(*args, **kw):
                 try:
+                    prev_pipeline_len = len(self._pipeline)
                     task = asyncio.ensure_future(attr(*args, **kw),
                                                  loop=self._loop)
                 except InvalidPipelineOperation:
@@ -104,7 +106,14 @@ class ClusterPipeline(object):
                 except Exception as exc:
                     task = self._loop.create_future()
                     task.set_exception(exc)
-                self._results.append(task)
+                # If we added a new command to the pipeline, let's store the
+                # actual command + args/kwargs in the results list as well (so
+                # that we can retry if necessary).
+                if len(self._pipeline) > prev_pipeline_len:
+                    _, cmd, cmd_args, cmd_kwargs = self._pipeline[-1]
+                else:
+                    cmd, cmd_args, cmd_kwargs = None, None, None
+                self._results.append((task, cmd, cmd_args, cmd_kwargs))
                 return task
             return wrapper
         return attr
@@ -112,7 +121,7 @@ class ClusterPipeline(object):
     def _cancel_pending_futures(self):
         for fut, _, _, _ in self._pipeline:
             fut.cancel()
-        for fut in self._results:
+        for fut, _, _, _ in self._results:
             fut.cancel()
 
     async def execute(self, *, return_exceptions=False):
@@ -148,10 +157,36 @@ class ClusterPipeline(object):
     async def _gather_result(self, return_exceptions):
         errors = []
         results = []
-        for fut in self._results:
+        for fut, cmd, args, kwargs in self._results:
             try:
                 res = await fut
                 results.append(res)
+            except ReplyError as e:
+                # If we get a MOVED or ASK back, we should send the command as
+                # we normally would using the cluster.
+                parsed_err = parse_cluster_response_error(e)
+                if parsed_err:
+                    if parsed_err.reply in ["MOVED", "ASK"]:
+                        kwargs.update({
+                            "address": parsed_err.args,
+                            "asking": parsed_err.reply == "ASK",
+                        })
+                        try:
+                            result = await self._cluster.execute(
+                                cmd,
+                                *args,
+                                **kwargs,
+                            )
+                            results.append(result)
+                        except Exception as exc:
+                            errors.append(exc)
+                            results.append(exc)
+                    else:
+                        errors.append(e)
+                        results.append(e)
+                else:
+                    errors.append(e)
+                    results.append(e)
             except Exception as exc:
                 errors.append(exc)
                 results.append(exc)

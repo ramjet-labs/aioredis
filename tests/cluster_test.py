@@ -2005,6 +2005,96 @@ async def test_pipeline_raises_errors_from_individual_operations(loop,
 
 @cluster_test
 @pytest.mark.run_loop
+async def test_pipeline_retries_on_moved_error(loop, test_cluster, free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+    )
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+    with CreateConnectionMock({
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }):
+        pipeline = test_cluster.pipeline()
+        fut1 = pipeline.set(SLOT_ZERO_KEY, "testval")
+        fut2 = pipeline.set(second_key, "testval2")
+        res = await pipeline.execute()
+
+        # The future results returned here will unfortunately contain the
+        # original exceptions.
+        res_check = await asyncio.gather(
+            fut1,
+            fut2,
+            loop=loop,
+            return_exceptions=True,
+        )
+
+    expected_connection.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    assert isinstance(res_check[0], ReplyError)
+    assert isinstance(res_check[1], ReplyError)
+    assert res == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pipeline_retries_on_ask_error(loop, test_cluster, free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("ASK 0 127.0.0.1:{}".format(free_ports[2])),
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+    )
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+    with CreateConnectionMock({
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }):
+        pipeline = test_cluster.pipeline()
+        fut1 = pipeline.set(SLOT_ZERO_KEY, "testval")
+        fut2 = pipeline.set(second_key, "testval2")
+        res = await pipeline.execute()
+
+        # The future results returned here will unfortunately contain the
+        # original exceptions.
+        res_check = await asyncio.gather(
+            fut1,
+            fut2,
+            loop=loop,
+            return_exceptions=True,
+        )
+
+    expected_connection.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call(b"ASKING"),
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"ASKING"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    assert isinstance(res_check[0], ReplyError)
+    assert isinstance(res_check[1], ReplyError)
+    assert res == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
 async def test_pool_pipeline_executes_on_multiple_keys(loop, test_pool_cluster):
     pipeline = test_pool_cluster.pipeline()
     fut1 = pipeline.set("{test}key", "testval")
@@ -2101,3 +2191,105 @@ async def test_pool_pipeline_raises_errors_from_individual_operations(
         mock.call(b"SET", second_key, "testval2"),
     ])
     assert "UH OH!" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_pipeline_retries_on_moved_error(loop,
+                                                    test_pool_cluster,
+                                                    free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+    )
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        {
+            free_ports[0]: expected_connection,
+            free_ports[2]: expected_connection_2,
+        },
+    ):
+        pipeline = test_pool_cluster.pipeline()
+        fut1 = pipeline.set(SLOT_ZERO_KEY, "testval")
+        fut2 = pipeline.set(second_key, "testval2")
+        res = await pipeline.execute()
+
+        # The future results returned here will unfortunately contain the
+        # original exceptions.
+        res_check = await asyncio.gather(
+            fut1,
+            fut2,
+            loop=loop,
+            return_exceptions=True,
+        )
+
+    expected_connection.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    assert isinstance(res_check[0], ReplyError)
+    assert isinstance(res_check[1], ReplyError)
+    assert res == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_pipeline_retries_on_ask_error(loop,
+                                                  test_pool_cluster,
+                                                  free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("ASK 0 127.0.0.1:{}".format(free_ports[2])),
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+    )
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        {
+            free_ports[0]: expected_connection,
+            free_ports[2]: expected_connection_2,
+        },
+    ):
+        pipeline = test_pool_cluster.pipeline()
+        fut1 = pipeline.set(SLOT_ZERO_KEY, "testval")
+        fut2 = pipeline.set(second_key, "testval2")
+        res = await pipeline.execute()
+
+        # The future results returned here will unfortunately contain the
+        # original exceptions.
+        res_check = await asyncio.gather(
+            fut1,
+            fut2,
+            loop=loop,
+            return_exceptions=True,
+        )
+
+    expected_connection.execute.assert_has_calls([
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call(b"ASKING"),
+        mock.call(b"SET", SLOT_ZERO_KEY, "testval"),
+        mock.call(b"ASKING"),
+        mock.call(b"SET", second_key, "testval2"),
+    ])
+    assert isinstance(res_check[0], ReplyError)
+    assert isinstance(res_check[1], ReplyError)
+    assert res == [True, True]
