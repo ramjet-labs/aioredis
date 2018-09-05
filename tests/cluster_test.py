@@ -5,15 +5,13 @@ import socket
 from unittest import mock
 
 import pytest
-
 from aioredis import ProtocolError, ReplyError
 from aioredis.cluster import RedisCluster, RedisPoolCluster
 from aioredis.cluster.cluster import (ClusterNode, ClusterNodesManager,
-                                      KnownReplyError, create_cluster,
-                                      create_pool_cluster,
-                                      parse_cluster_response_error)
+                                      create_cluster, create_pool_cluster)
 from aioredis.cluster.testcluster import TestCluster as Cluster
 from aioredis.cluster.transaction import InvalidPipelineOperation
+from aioredis.cluster.util import KnownReplyError, parse_cluster_response_error
 from aioredis.commands import ContextRedis
 from aioredis.commands.cluster import (parse_cluster_nodes,
                                        parse_cluster_nodes_lines,
