@@ -283,7 +283,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
             command = command.decode('utf-8')
         return command.lower() in ['eval', 'evalsha']
 
-    def get_node(self, command, *args, **kwargs):
+    def get_slot(self, command, *args, **kwargs):
         if self._is_eval_command(command):
             keys = kwargs.get('keys', [])
             if not isinstance(keys, (list, tuple)):
@@ -291,8 +291,13 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
         else:
             keys = args[:1]
 
-        if len(keys) > 0:
-            slot = self._cluster_manager.determine_slot(*keys)
+        if keys:
+            return self._cluster_manager.determine_slot(*keys)
+        return None
+
+    def get_node(self, command, *args, **kwargs):
+        slot = self.get_slot(command, *args, **kwargs)
+        if slot is not None:
             node = self._cluster_manager.get_node_by_slot(slot)
             if node is not None:
                 return node
