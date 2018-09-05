@@ -40,22 +40,33 @@ class ClusterTransactionsMixin(object):
 
 class _RedisBuffer(object):
 
-    def __init__(self, pipeline, cluster, *, loop=None):
+    def __init__(self, pipeline, cluster, *, loop=None, force_same_slot=False):
         if loop is None:
             loop = asyncio.get_event_loop()
         self._pipeline = pipeline
         self._cluster = cluster
         self._loop = loop
+        self._force_same_slot = force_same_slot
         self.node = None
+        self.slot = None
 
     def execute(self, cmd, *args, **kwargs):
-        expected_node = self._cluster.get_node(cmd, *args, **kwargs)
-        if self.node is None or expected_node == self.node:
-            self.node = expected_node
+        if self._force_same_slot:
+           expected_slot = self._cluster.get_slot(cmd, *args, **kwargs)
+           if self.slot is None or expected_slot == self.slot:
+               self.slot = expected_slot
+           else:
+                raise InvalidPipelineOperation(
+                    "All keys in pipeline must belong to the same slot!"
+                )
         else:
-            raise InvalidPipelineOperation(
-                "All keys in pipeline must point to same node!"
-            )
+            expected_node = self._cluster.get_node(cmd, *args, **kwargs)
+            if self.node is None or expected_node == self.node:
+                self.node = expected_node
+            else:
+                raise InvalidPipelineOperation(
+                    "All keys in pipeline must point to same node!"
+                )
 
         fut = self._loop.create_future()
         self._pipeline.append((fut, cmd, args, kwargs))
