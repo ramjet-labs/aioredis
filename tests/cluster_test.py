@@ -772,6 +772,27 @@ async def test_execute_with_moved(loop, test_cluster, free_ports):
 
 @cluster_test
 @pytest.mark.run_loop
+async def test_execute_with_asking_param(loop, test_cluster, free_ports):
+    expected_connection = FakeConnection(free_ports[0], loop)
+    with CreateConnectionMock({free_ports[0]: expected_connection}):
+        ok = await test_cluster.execute(
+            'SET',
+            SLOT_ZERO_KEY,
+            'value',
+            address=("127.0.0.1", free_ports[0]),
+            asking=True,
+        )
+
+    assert ok
+
+    expected_connection.execute.assert_has_calls([
+        mock.call(b'ASKING'),
+        mock.call(b'SET', SLOT_ZERO_KEY, 'value'),
+    ])
+
+
+@cluster_test
+@pytest.mark.run_loop
 async def test_execute_with_ask(loop, test_cluster, free_ports):
     expected_connections = {
         free_ports[0]: FakeConnection(
@@ -1249,6 +1270,24 @@ async def test_pool_execute_command(loop, test_pool_cluster, free_ports):
             test_pool_cluster, loop, {free_ports[0]: expected_connection}
     ):
         ok = await test_pool_cluster.set(SLOT_ZERO_KEY, 'value')
+
+    assert ok
+
+    expected_connection.execute.assert_called_once_with(
+        b'SET', SLOT_ZERO_KEY, 'value'
+    )
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_execute_with_address(loop, test_pool_cluster, free_ports):
+    expected_connection = FakeConnection(free_ports[1], loop)
+    with PoolConnectionMock(
+            test_pool_cluster, loop, {free_ports[1]: expected_connection}
+    ):
+        ok = await test_pool_cluster.execute(
+            "SET", SLOT_ZERO_KEY, 'value', address=("127.0.0.1", free_ports[1]),
+        )
 
     assert ok
 

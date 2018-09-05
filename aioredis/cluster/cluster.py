@@ -648,7 +648,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             ttl -= 1
 
             try:
-                if asking:
+                if asking or pool is None:
                     node = self._cluster_manager.get_node_by_address(address)
                     pool_to_use = self._cluster_pool[node.id]
                 elif try_random_node:
@@ -700,7 +700,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
 
         raise RedisClusterError("TTL exhausted.")
 
-    async def execute(self, command, *args, many=False, **kwargs):
+    async def execute(self, command, *args, address=None, many=False, **kwargs):
         """Execute redis command and returns Future waiting for the answer.
 
         :param command str
@@ -722,9 +722,18 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                     await self.initialize()
                     self._refresh_nodes_asap = False
 
-        node = self.get_node(command, *args, **kwargs)
-        pool = self._cluster_pool[node.id]
-        return await self._execute_node(pool, command, *args, **kwargs)
+        if address:
+            pool = None
+        else:
+            node = self.get_node(command, *args, **kwargs)
+            pool = self._cluster_pool[node.id]
+        return await self._execute_node(
+            pool,
+            command,
+            *args,
+            address=address,
+            **kwargs,
+        )
 
 
 class ClusterConnectionContext(object):
