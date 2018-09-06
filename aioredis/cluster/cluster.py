@@ -283,11 +283,18 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
             command = command.decode('utf-8')
         return command.lower() in ['eval', 'evalsha']
 
+    def _is_multi_key_command(self, command):
+        if isinstance(command, bytes):
+            command = command.decode('utf-8')
+        return command.lower() in ['watch', 'del']
+
     def get_slot(self, command, *args, **kwargs):
         if self._is_eval_command(command):
             keys = kwargs.get('keys', [])
             if not isinstance(keys, (list, tuple)):
                 raise TypeError('keys must be given as list or tuple')
+        elif self._is_multi_key_command(command):
+            keys = args
         else:
             keys = args[:1]
 
