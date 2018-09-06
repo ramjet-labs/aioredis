@@ -5,6 +5,7 @@ import socket
 from unittest import mock
 
 import pytest
+
 from aioredis import ProtocolError, ReplyError
 from aioredis.cluster import RedisCluster, RedisPoolCluster
 from aioredis.cluster.cluster import (ClusterNode, ClusterNodesManager,
@@ -759,15 +760,20 @@ async def test_execute_with_moved(loop, test_cluster, free_ports):
     }
     with CreateConnectionMock(expected_connections):
         ok = await test_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+        # This should be cached as going to free_ports[1]
+        ok_2 = await test_cluster.execute("SET", SLOT_ZERO_KEY, "value")
 
     assert ok
+    assert ok_2
 
     expected_connections[free_ports[0]].execute.assert_called_once_with(
         b'SET', SLOT_ZERO_KEY, 'value'
     )
-    expected_connections[free_ports[1]].execute.assert_called_once_with(
-        b'SET', SLOT_ZERO_KEY, 'value'
-    )
+    expected_connections[free_ports[1]].execute.assert_has_calls([
+        mock.call(b'SET', SLOT_ZERO_KEY, 'value'),
+        mock.call(b'SET', SLOT_ZERO_KEY, 'value'),
+    ])
+
 
 
 @cluster_test
@@ -1076,15 +1082,19 @@ async def test_pool_execute_with_moved(loop, test_pool_cluster, free_ports):
             }
     ):
         ok = await test_pool_cluster.execute('SET', SLOT_ZERO_KEY, 'value')
+        # The new address should have been cached.
+        ok_2 = await test_pool_cluster.execute("SET", SLOT_ZERO_KEY, "value")
 
     assert ok
+    assert ok_2
 
     expected_pool_connection.execute.assert_called_once_with(
         b'SET', SLOT_ZERO_KEY, 'value'
     )
-    expected_pool_connection_two.execute.assert_called_once_with(
-        b'SET', SLOT_ZERO_KEY, 'value'
-    )
+    expected_pool_connection_two.execute.assert_has_calls([
+        mock.call(b'SET', SLOT_ZERO_KEY, 'value'),
+        mock.call(b'SET', SLOT_ZERO_KEY, 'value'),
+    ])
 
 
 @cluster_test

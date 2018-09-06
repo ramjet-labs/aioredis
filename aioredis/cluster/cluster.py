@@ -480,6 +480,13 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
                             raise
                         logger.debug('Got MOVED command: %s', str(err))
                         address = parsed_error.args
+                        # Cache this new node if it already exists.
+                        node = self._cluster_manager.get_node_by_address(
+                            address
+                        )
+                        if node:
+                            slot = self.get_slot(command, *args, **kwargs)
+                            self._cluster_manager.slots[slot][0] = node
                         self._moved_count += 1
                         if self._moved_count >= self.MAX_MOVED_COUNT:
                             async with self._initalize_lock:
@@ -687,6 +694,13 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                         raise
                     logger.debug('Got MOVED command: %s', str(err))
                     address = parsed_error.args
+                    # Cache this new node if it already exists.
+                    node = self._cluster_manager.get_node_by_address(
+                        address
+                    )
+                    if node:
+                        slot = self.get_slot(command, *args, **kwargs)
+                        self._cluster_manager.slots[slot][0] = node
                     self._moved_count += 1
                     if self._moved_count >= self.MAX_MOVED_COUNT:
                         async with self._initalize_lock:
