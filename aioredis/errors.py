@@ -55,6 +55,7 @@ class PipelineError(RedisError):
 
     def __init__(self, errors):
         super().__init__('{} errors:'.format(self.__class__.__name__), errors)
+        self.errors = errors
 
 
 class MultiExecError(PipelineError):
