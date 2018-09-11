@@ -1,7 +1,9 @@
 import asyncio
 import functools
 
-from ..errors import PipelineError, RedisError, ReplyError
+from ..errors import (ConnectionClosedError, MultiExecError, PipelineError,
+                      RedisError, ReplyError)
+from ..util import _set_exception
 from .util import parse_cluster_response_error
 
 
@@ -36,6 +38,48 @@ class ClusterTransactionsMixin(object):
         """
         return ClusterPipeline(self, commands_factory=self._factory,
                                loop=self._loop)
+
+    async def transaction(self, coro, *watched_keys):
+        """
+        Creates a transaction that will watch the specified keys. Note that
+        execute must be called explicitly. In addition, all watched keys and all
+        keys in the transaction's operations must hash to the same slot.
+
+        Since the transaction will automatically retry certain errors, it is not
+        necessary to record the futures of the individual operations and compare
+        the result with the result of execute.
+
+        This function also requires a coroutine which given a cluster
+        object and transaction object, should fetch keys from the cluster and
+        conduct various checks, before pipelining commands into the transaction.
+        If this function raises an exception or returns False, then any watched
+        keys will be unwatched, and the transaction will not execute.
+        As an example:
+
+            async def _coro(cluster, transaction):
+                key1 = await cluster.get("key1")
+                if key1 != "expected_value":
+                    return False
+                key2 = await cluster.get("key2")
+                if key2 != "expected_value2":
+                    raise Exception("Got wrong key2")
+                transaction.incr("{key}"foo")
+                transaction.incr("{key}"foo2")
+                transaction.set("{key}3", key1)
+
+        Usage:
+        >>> transaction = await cluster.transaction(
+                _coro,
+                "{key}foo",
+                "{key}foo2",
+            )
+        """
+        multi_exec = ClusterMultiExec(cluster=self,
+                                      watched_keys=watched_keys,
+                                      coro=coro,
+                                      commands_factory=self._factory,
+                                      loop=self._loop)
+        return await multi_exec.execute()
 
 
 class _RedisBuffer(object):
@@ -96,6 +140,7 @@ class ClusterPipeline(object):
         self._buffer = _RedisBuffer(self._pipeline, cluster=cluster, loop=loop)
         self._redis = commands_factory(self._buffer)
         self._done = False
+        self._commands = []
 
     def __getattr__(self, name):
         assert not self._done, "Pipeline already executed. Create new one."
@@ -125,15 +170,18 @@ class ClusterPipeline(object):
                 else:
                     cmd, cmd_args, cmd_kwargs = None, None, None
                 self._results.append((task, cmd, cmd_args, cmd_kwargs))
+                self._commands.append((name, args, kw))
                 return task
             return wrapper
         return attr
 
     def _cancel_pending_futures(self):
         for fut, _, _, _ in self._pipeline:
-            fut.cancel()
+            if not fut.done():
+                fut.cancel()
         for fut, _, _, _ in self._results:
-            fut.cancel()
+            if not fut.done():
+                fut.cancel()
 
     async def execute(self, *, return_exceptions=False):
         """Execute all buffered commands.
@@ -178,6 +226,8 @@ class ClusterPipeline(object):
                 parsed_err = parse_cluster_response_error(e)
                 if parsed_err:
                     if parsed_err.reply in ["MOVED", "ASK"]:
+                        if parsed_err.reply == "MOVED":
+                            await self._cluster.increment_moved_count()
                         kwargs.update({
                             "address": parsed_err.args,
                             "asking": parsed_err.reply == "ASK",
@@ -192,6 +242,10 @@ class ClusterPipeline(object):
                         except Exception as exc:
                             errors.append(exc)
                             results.append(exc)
+                    elif parsed_err.reply == "CLUSTERDOWN":
+                        await self._cluster.initialize_asap()
+                        errors.append(e)
+                        results.append(e)
                     else:
                         errors.append(e)
                         results.append(e)
@@ -201,6 +255,7 @@ class ClusterPipeline(object):
             except Exception as exc:
                 errors.append(exc)
                 results.append(exc)
+
         if errors and not return_exceptions:
             raise self.error_class(errors)
         return results
@@ -223,3 +278,288 @@ class ClusterPipeline(object):
             waiter.set_exception(fut.exception())
         else:
             waiter.set_result(fut.result())
+
+
+class ClusterMultiExec(ClusterPipeline):
+    """Transaction pipeline for a redis cluster.
+
+    Transactions only allow for operations on keys that all map to the same
+    slot. If an operation is attempted on set of key(s) that
+    would map to a slot that is different than the existing operations, then an
+    InvalidPipelineOperation will be raised, and all existing pipelined
+    operations will be cancelled.
+    """
+
+    error_class = MultiExecError
+    MAX_EXECUTION_ATTEMPTS = 10
+
+    def __init__(self,
+                 cluster,
+                 watched_keys,
+                 coro,
+                 commands_factory=lambda cluster: cluster,
+                 *,
+                 loop=None):
+        """
+        Creates a transaction pipeline:
+
+        cluster: The cluster against which the transaction should be run.
+        watched_keys: A list of keys to be watched (can be empty).
+        coro: A coroutine that should be run between the time the
+            keys are watched and the transaction is executed. This
+            function should accept a cluster object and transaction object, and
+            should execute any fetches using the cluster object, and pipeline
+            any operations into the transaction. If this function raises an
+            exception or False, then any watched keys will be unwatched, and the
+            transaction will not execute. If all checks succeed, the function
+            should return True.
+        """
+        super().__init__(cluster, commands_factory=commands_factory, loop=loop)
+        self._buffer = _RedisBuffer(
+            self._pipeline,
+            cluster=cluster,
+            loop=loop,
+            force_same_slot=True,
+        )
+        self._redis = commands_factory(self._buffer)
+        self._watched_keys = watched_keys
+        if watched_keys:
+            # Force the buffer slot so all future pipelined requests are
+            # verified compared to the WATCH.
+            self._buffer.slot = self._cluster.get_slot("WATCH", *watched_keys)
+        self._coro = coro
+
+    def watch(self, *keys):
+        raise InvalidPipelineOperation(
+            "Cannot watch after starting transaction."
+        )
+
+    async def execute(self, *, return_exceptions=False):
+        """Execute all buffered commands.
+
+        Any exception that is raised by any command is caught and
+        raised later when processing results.
+
+        Exceptions can also be returned in result if
+        `return_exceptions` flag is set to True.
+        """
+        assert not self._done, "Pipeline already executed. Create new one."
+
+        try:
+            return await self._execute_pipeline(return_exceptions)
+        finally:
+            self._cancel_pending_futures()
+            self._done = True
+
+    async def _get_conn_context(self, slot, address):
+        if address:
+            conn_context = await self._cluster.get_conn_context_for_address(
+                address
+            )
+        else:
+            conn_context = await self._cluster.get_conn_context_for_slot(
+                slot
+            )
+        return conn_context
+
+    async def _execute_pipeline(self,
+                                return_exceptions,
+                                retries=3):
+        """
+        Actually execute the pipeline. This will handle processing any possible
+        MOVED requests that occur during execution of the pipeline.
+        """
+        address = None
+        while retries > 0:
+            retries -= 1
+            # Reset the pipeline and result tasks. This is so when we execute
+            # the transaction's coro it can safely re-populate the pipeline and
+            # results tasks.
+            self._reset_pipeline_and_results()
+            # If we are not watching any keys, we should set up the pipeline
+            # immediately.
+            if not self._watched_keys:
+                if await self._coro(self._cluster, self) is False:
+                    return []
+                # If no pipeline was created in the coro, then we should short
+                # circuit and gather whatever we have.
+                if not self._pipeline:
+                    return await self._gather_result(return_exceptions)
+            conn_context = await self._get_conn_context(
+                self._buffer.slot,
+                address,
+            )
+            async with conn_context as conn:
+                try:
+                    # An exception will be raised if the WATCH or MULTI fails.
+                    results = await self._do_execute(
+                        conn,
+                        return_exceptions=True,
+                    )
+
+                except ReplyError as e:
+                    parsed_err = parse_cluster_response_error(e)
+                    if not parsed_err:
+                        raise
+                    if parsed_err.reply == "CLUSTERDOWN":
+                        await self._cluster.initialize_asap()
+                        raise
+                    if parsed_err.reply == "MOVED":
+                        address = parsed_err.args
+                        await self._cluster.increment_moved_count()
+                        await self._cluster.update_node_for_slot(
+                            address,
+                            self._buffer.slot
+                        )
+                        continue
+                    else:
+                        raise
+                else:
+                    results = await self._process_pipeline_results(
+                        return_exceptions,
+                        results,
+                        self._buffer.slot,
+                        address,
+                    )
+                    # If we are expected to retry, do so, otherwise exit
+                    # immediately with the results.
+                    if results[0]:
+                        address = results[1]
+                    else:
+                        return results[1]
+
+        raise MultiExecError("Could not execute transaction!")
+
+    async def _process_pipeline_results(self,
+                                        return_exceptions,
+                                        results,
+                                        slot,
+                                        address):
+        # If any of the requests returned a ReplyError that was MOVED,
+        # we can assume that all of them did, since all keys in the transaction
+        # must map to the same slot. Reconstruct the pipeline/results and re-try
+        # the request with the updated address.
+        errors = []
+        for result in results:
+            if isinstance(result, ReplyError):
+                parsed_err = parse_cluster_response_error(result)
+                if not parsed_err:
+                    errors.append(result)
+                elif parsed_err.reply == "MOVED":
+                    address = parsed_err.args
+                    await self._cluster.increment_moved_count()
+                    await self._cluster.update_node_for_slot(address, slot)
+                    return True, address
+                elif parsed_err.reply == "CLUSTERDOWN":
+                    await self._cluster.initialize_asap()
+                    errors.append(result)
+                else:
+                    errors.append(result)
+            elif isinstance(result, Exception):
+                errors.append(result)
+
+        if errors and not return_exceptions:
+            raise self.error_class(errors)
+        return False, results
+
+    def _reset_pipeline_and_results(self):
+        """Construct a new pipeline and results list based off the old one."""
+        self._cancel_pending_futures()
+        self._pipeline = []
+        self._buffer._pipeline = self._pipeline
+        self._results = []
+
+    async def _do_execute(self, conn, *, return_exceptions=False):
+        self._waiters = waiters = []
+        # Let this error bubble up.
+        if self._watched_keys:
+            await conn.execute("WATCH", *self._watched_keys)
+
+            try:
+                # The coro will have already been executed if we didn't watch
+                # any keys.
+                if await self._coro(self._cluster, self) is False:
+                    await conn.unwatch()
+                    return []
+            except:
+                await conn.unwatch()
+                raise
+
+            # If no pipeline was created in the coro, then we should short
+            # circuit and gather whatever we have.
+            if not self._pipeline:
+                return await self._gather_result(return_exceptions)
+        multi = conn.execute("MULTI")
+
+        coros = list(self._send_pipeline(conn))
+        exec_ = conn.execute("EXEC")
+        gather = asyncio.gather(multi, *coros, loop=self._loop,
+                                return_exceptions=True)
+        last_error = None
+        try:
+            await asyncio.shield(gather, loop=self._loop)
+        except asyncio.CancelledError:
+            await gather
+        except Exception as err:
+            last_error = err
+            raise
+        finally:
+            if conn.closed:
+                if last_error is None:
+                    last_error = ConnectionClosedError()
+                for fut in waiters:
+                    _set_exception(fut, last_error)
+                for fut, _, _, _ in self._results:
+                    if not fut.done():
+                        fut.set_exception(last_error)
+            else:
+                try:
+                    results = await exec_
+                except RedisError as err:
+                    for fut in waiters:
+                        fut.set_exception(err)
+                else:
+                    assert len(results) == len(waiters), (
+                        "Results does not match waiters",
+                        results,
+                        waiters,
+                    )
+                    self._resolve_waiters(results, return_exceptions)
+            return (await self._gather_result(return_exceptions))
+
+    async def _gather_result(self, return_exceptions):
+        errors = []
+        results = []
+        for fut, _, _, _ in self._results:
+            try:
+                res = await fut
+                results.append(res)
+            except Exception as exc:
+                errors.append(exc)
+                results.append(exc)
+        if errors and not return_exceptions:
+            raise self.error_class(errors)
+        return results
+
+    def _resolve_waiters(self, results, return_exceptions):
+        errors = []
+        for val, fut in zip(results, self._waiters):
+            if isinstance(val, RedisError):
+                fut.set_exception(val)
+                errors.append(val)
+            else:
+                fut.set_result(val)
+        if errors and not return_exceptions:
+            raise MultiExecError(errors)
+
+    def _check_result(self, fut, waiter):
+        assert waiter not in self._waiters, (fut, waiter, self._waiters)
+        assert not waiter.done(), waiter
+        # await gather was cancelled.
+        if fut.cancelled():
+            waiter.cancel()
+        # server replied with error
+        elif fut.exception():
+            waiter.set_exception(fut.exception())
+        elif fut.result() in {b"QUEUED", "QUEUED"}:
+            self._waiters.append(waiter)

@@ -17,7 +17,8 @@ from aioredis.commands import ContextRedis
 from aioredis.commands.cluster import (parse_cluster_nodes,
                                        parse_cluster_nodes_lines,
                                        parse_cluster_slots)
-from aioredis.errors import PipelineError, RedisClusterError
+from aioredis.errors import MultiExecError, PipelineError, RedisClusterError
+from aioredis.util import _NOTSET
 
 RAW_SLAVE_INFO_DATA = b"""\
 824fe116063bc5fcf9f4ffd895bc17aee7731ac3 127.0.0.1:30006 slave \
@@ -2342,3 +2343,1007 @@ async def test_pool_pipeline_retries_on_ask_error(loop,
     assert isinstance(res_check[0], ReplyError)
     assert isinstance(res_check[1], ReplyError)
     assert res == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_with_keys_same_slot(loop,
+                                               test_cluster,
+                                               free_ports):
+
+    async def _coro(cluster, transaction):
+        transaction.set("{key}1", "1")
+        transaction.set("{key}2", "2")
+
+    # Don't worry about watching for now.
+    result = await test_cluster.transaction(_coro)
+    assert result == [True, True]
+
+    assert (await test_cluster.get("{key}1")) == "1"
+    assert (await test_cluster.get("{key}2")) == "2"
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_with_keys_different_slot_errors(loop,
+                                                           test_cluster,
+                                                           free_ports):
+    async def _coro(cluster, transaction):
+        transaction.set("{key}1", "1")
+        transaction.set("{key1}2", "2")
+
+    # Don't worry about watching for now.
+    with pytest.raises(InvalidPipelineOperation):
+        await test_cluster.transaction(_coro)
+
+    assert (await test_cluster.get("{key}1")) is None
+    assert (await test_cluster.get("{key1}2")) is None
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_with_keys_different_slot_and_watch_errors(
+    loop,
+    test_cluster,
+    free_ports,
+):
+    async def _coro(cluster, transaction):
+        transaction.set("{key1}2", "2")
+
+    with pytest.raises(InvalidPipelineOperation):
+        await test_cluster.transaction(_coro, "{key}1")
+
+    assert (await test_cluster.get("{key}2")) is None
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_properly_calls_watch(loop, test_cluster, free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with CreateConnectionMock({free_ports[0]: expected_connection}):
+        result = await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_moved_in_watch(loop,
+                                                  test_cluster,
+                                                  free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with CreateConnectionMock(expected_connections):
+        result = await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_called_once_with(
+        "WATCH",
+        watched_key,
+    )
+    expected_connection_2.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_moved_no_watched_keys(loop,
+                                                         test_cluster,
+                                                         free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # MULTI,
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 1
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 2
+            ReplyError("EXECABORT"),
+        ],
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+        side_effect=[
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }
+    first_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(first_key, "1")
+        trans.set(second_key, "2")
+
+    with CreateConnectionMock(expected_connections):
+        result = await test_cluster.transaction(_coro)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("MULTI"),
+        mock.call(b"SET", first_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call("MULTI"),
+        mock.call(b"SET", first_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_moved_in_transaction(loop,
+                                                        test_cluster,
+                                                        free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI,
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 1
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 2
+            ReplyError("EXECABORT"),
+        ],
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with CreateConnectionMock(expected_connections):
+        result = await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_raises_unknown_watch_reply_error(loop,
+                                                            test_cluster,
+                                                            free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("UH OH"),
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with CreateConnectionMock(expected_connections):
+        with pytest.raises(ReplyError) as e:
+            await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_called_once_with(
+        "WATCH", watched_key,
+    )
+    assert "UH OH" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_raises_unknown_watch_error(loop,
+                                                      test_cluster,
+                                                      free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ConnectionError("UH OH"),
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with CreateConnectionMock(expected_connections):
+        with pytest.raises(ConnectionError) as e:
+            await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_called_once_with(
+        "WATCH", watched_key,
+    )
+    assert "UH OH" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_raises_error_from_transaction(loop,
+                                                         test_cluster,
+                                                         free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            ReplyError("UH OH"),  # EXEC
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with CreateConnectionMock(expected_connections):
+        with pytest.raises(MultiExecError) as e:
+            await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert "ReplyError('UH OH',)" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_exception_in_coro(loop,
+                                                     test_cluster,
+                                                     free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"WRONG_VALUE", # GET
+            b"OK",  # UNWATCH
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(watched_key)
+        if val != "RIGHT_VALUE":
+            raise Exception("Got the wrong value!")
+        transaction.set(watched_key, "123")
+
+    with CreateConnectionMock(expected_connections):
+        with pytest.raises(Exception) as e:
+            await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call(b"GET", watched_key, encoding=_NOTSET),
+        mock.call(b"UNWATCH"),
+    ])
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_False_in_coro(loop,
+                                                 test_cluster,
+                                                 free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"WRONG_VALUE", # GET
+            b"OK",  # UNWATCH
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(watched_key)
+        if val != "RIGHT_VALUE":
+            return False
+        transaction.set(watched_key, "123")
+
+    with CreateConnectionMock(expected_connections):
+        result = await test_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call(b"GET", watched_key, encoding=_NOTSET),
+        mock.call(b"UNWATCH"),
+    ])
+    assert result == []
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_False_in_coro_no_watched_keys(loop,
+                                                                 test_cluster,
+                                                                 free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"WRONG_VALUE", # GET
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(key)
+        if val != "RIGHT_VALUE":
+            return False
+        transaction.set(key, "123")
+
+    with CreateConnectionMock(expected_connections):
+        result = await test_cluster.transaction(_coro)
+
+    expected_connection.execute.assert_called_once_with(
+        b"GET", key, encoding=_NOTSET
+    )
+    assert result == []
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_empty_pipeline_no_watch(loop,
+                                                           test_cluster,
+                                                           free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"WRONG_VALUE", # GET
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(key)
+
+    with CreateConnectionMock(expected_connections):
+        result = await test_cluster.transaction(_coro)
+
+    expected_connection.execute.assert_called_once_with(
+        b"GET", key, encoding=_NOTSET
+    )
+    assert result == []
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_transaction_handles_empty_pipeline_with_watch(loop,
+                                                             test_cluster,
+                                                             free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",          # WATCH
+            b"WRONG_VALUE", # GET
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(key)
+
+    with CreateConnectionMock(expected_connections):
+        result = await test_cluster.transaction(_coro, key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", key),
+        mock.call(b"GET", key, encoding=_NOTSET),
+    ])
+    assert result == []
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_with_keys_same_slot(loop,
+                                                    test_pool_cluster,
+                                                    free_ports):
+
+    async def _coro(cluster, transaction):
+        transaction.set("{key}1", "1")
+        transaction.set("{key}2", "2")
+
+    # Don't worry about watching for now.
+    result = await test_pool_cluster.transaction(_coro)
+    assert result == [True, True]
+
+    assert (await test_pool_cluster.get("{key}1")) == "1"
+    assert (await test_pool_cluster.get("{key}2")) == "2"
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_with_keys_different_slot_errors(
+    loop,
+    test_pool_cluster,
+    free_ports
+):
+    async def _coro(cluster, transaction):
+        transaction.set("{key}1", "1")
+        transaction.set("{key1}2", "2")
+
+    # Don't worry about watching for now.
+    with pytest.raises(InvalidPipelineOperation):
+        await test_pool_cluster.transaction(_coro)
+
+    assert (await test_pool_cluster.get("{key}1")) is None
+    assert (await test_pool_cluster.get("{key1}2")) is None
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_with_keys_different_slot_and_watch_errors(
+    loop,
+    test_pool_cluster,
+    free_ports,
+):
+    async def _coro(cluster, transaction):
+        transaction.set("{key1}2", "2")
+
+    with pytest.raises(InvalidPipelineOperation):
+        await test_pool_cluster.transaction(_coro, "{key}1")
+
+    assert (await test_pool_cluster.get("{key}2")) is None
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_properly_calls_watch(
+    loop,
+    test_pool_cluster,
+    free_ports,
+):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        {free_ports[0]: expected_connection},
+    ):
+        result = await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_handles_moved_in_watch(loop,
+                                                       test_pool_cluster,
+                                                       free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        result = await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_called_once_with(
+        "WATCH",
+        watched_key,
+    )
+    expected_connection_2.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_handles_moved_no_watched_keys(loop,
+                                                              test_pool_cluster,
+                                                              free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # MULTI,
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 1
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 2
+            ReplyError("EXECABORT"),
+        ],
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+        side_effect=[
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }
+    first_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(first_key, "1")
+        trans.set(second_key, "2")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        result = await test_pool_cluster.transaction(_coro)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("MULTI"),
+        mock.call(b"SET", first_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call("MULTI"),
+        mock.call(b"SET", first_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_handles_moved_in_transaction(loop,
+                                                             test_pool_cluster,
+                                                             free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI,
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 1
+            ReplyError("MOVED 0 127.0.0.1:{}".format(free_ports[2])),  # CMD 2
+            ReplyError("EXECABORT"),
+        ],
+    )
+    expected_connection_2 = FakeConnection(
+        port=free_ports[2],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            [b"OK", b"OK"],  # EXECUTE
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+        free_ports[2]: expected_connection_2,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        result = await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    expected_connection_2.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert result == [True, True]
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_raises_unknown_watch_reply_error(
+    loop,
+    test_pool_cluster,
+    free_ports,
+):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ReplyError("UH OH"),
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        with pytest.raises(ReplyError) as e:
+            await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_called_once_with(
+        "WATCH", watched_key,
+    )
+    assert "UH OH" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_raises_unknown_watch_error(loop,
+                                                           test_pool_cluster,
+                                                           free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        return_value=ConnectionError("UH OH"),
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        with pytest.raises(ConnectionError) as e:
+            await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_called_once_with(
+        "WATCH", watched_key,
+    )
+    assert "UH OH" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_raises_error_from_transaction(loop,
+                                                              test_pool_cluster,
+                                                              free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"OK",  # MULTI
+            b"QUEUED",  # COMMAND 1
+            b"QUEUED",  # COMMAND 2
+            ReplyError("UH OH"),  # EXEC
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    second_key = "{{{}}}2".format(SLOT_ZERO_KEY)
+
+    async def _coro(cluster, trans):
+        trans.set(watched_key, "1")
+        trans.set(second_key, "2")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        with pytest.raises(MultiExecError) as e:
+            await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call("MULTI"),
+        mock.call(b"SET", watched_key, "1"),
+        mock.call(b"SET", second_key, "2"),
+        mock.call("EXEC"),
+    ])
+    assert "ReplyError('UH OH',)" in str(e)
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_handles_exception_in_coro(loop,
+                                                          test_pool_cluster,
+                                                          free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"WRONG_VALUE", # GET
+            b"OK",  # UNWATCH
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(watched_key)
+        if val != "RIGHT_VALUE":
+            raise Exception("Got the wrong value!")
+        transaction.set(watched_key, "123")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        with pytest.raises(Exception) as e:
+            await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call(b"GET", watched_key, encoding=_NOTSET),
+        mock.call(b"UNWATCH"),
+    ])
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_handles_False_in_coro(loop,
+                                                      test_pool_cluster,
+                                                      free_ports):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"OK",  # WATCH
+            b"WRONG_VALUE", # GET
+            b"OK",  # UNWATCH
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    watched_key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(watched_key)
+        if val != "RIGHT_VALUE":
+            return False
+        transaction.set(watched_key, "123")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        result = await test_pool_cluster.transaction(_coro, watched_key)
+
+    expected_connection.execute.assert_has_calls([
+        mock.call("WATCH", watched_key),
+        mock.call(b"GET", watched_key, encoding=_NOTSET),
+        mock.call(b"UNWATCH"),
+    ])
+    assert result == []
+
+
+@cluster_test
+@pytest.mark.run_loop
+async def test_pool_transaction_handles_False_in_coro_no_watched_keys(
+    loop,
+    test_pool_cluster,
+    free_ports
+):
+    expected_connection = FakeConnection(
+        port=free_ports[0],
+        loop=loop,
+        side_effect=[
+            b"WRONG_VALUE", # GET
+        ],
+    )
+    expected_connections = {
+        free_ports[0]: expected_connection,
+    }
+    key = "{{{}}}1".format(SLOT_ZERO_KEY)
+    async def _coro(cluster, transaction):
+        val = await cluster.get(key)
+        if val != "RIGHT_VALUE":
+            return False
+        transaction.set(key, "123")
+
+    with PoolConnectionMock(
+        test_pool_cluster,
+        loop,
+        expected_connections,
+    ):
+        result = await test_pool_cluster.transaction(_coro)
+
+    expected_connection.execute.assert_called_once_with(
+        b"GET", key, encoding=_NOTSET
+    )
+    assert result == []
