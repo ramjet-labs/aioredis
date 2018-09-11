@@ -618,6 +618,23 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             cluster_pool[node.id] = connection
         return cluster_pool
 
+    async def get_pool_for_node(self, node):
+        if node.id in self._cluster_pool:
+            return self._cluster_pool[node.id]
+
+        connection = await create_redis_pool(
+            node.address,
+            db=self._db,
+            password=self._password,
+            encoding=self._encoding,
+            minsize=self._minsize,
+            maxsize=self._maxsize,
+            commands_factory=self._factory,
+            loop=self._loop,
+        )
+        self._cluster_pool[node.id] = connection
+        return connection
+
     async def reload_cluster_pool(self):
         logger.debug('Reloading cluster...')
         await self.clear()
@@ -633,12 +650,13 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
 
     async def clear(self):
         """Clear pool connections. Close and remove all free connections."""
-        for pool in self._get_nodes_entities():
+        for pool in self._cluster_pool.values():
             pool.close()
             await pool.wait_closed()
 
     async def get_conn_context_for_node(self, node):
-        return ClusterConnectionContext(self._cluster_pool[node.id])
+        pool = await self.get_pool_for_node(node)
+        return ClusterConnectionContext(pool)
 
     async def get_conn_context_for_slot(self, slot):
         node = self._cluster_manager.get_node_by_slot(slot)
@@ -646,7 +664,8 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             raise RedisClusterError(
                 "No master available for slot {}!".format(slot)
             )
-        return ClusterConnectionContext(self._cluster_pool[node.id])
+        pool = await self.get_pool_for_node(node)
+        return ClusterConnectionContext(pool)
 
     async def _execute_node(self,
                             pool,
@@ -676,10 +695,10 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             try:
                 if asking or pool is None:
                     node = self._cluster_manager.get_node_by_address(address)
-                    pool_to_use = self._cluster_pool[node.id]
+                    pool_to_use = await self.get_pool_for_node(node)
                 elif try_random_node:
                     node = self._cluster_manager.get_random_master_node()
-                    pool_to_use = self._cluster_pool[node.id]
+                    pool_to_use = await self.get_pool_for_node(node)
                     try_random_node = False
 
                 with await pool_to_use as conn:
@@ -710,7 +729,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                         self._cluster_manager.slots[slot][0] = node
                     await self.increment_moved_count()
                     node = self._cluster_manager.get_node_by_address(address)
-                    pool_to_use = self._cluster_pool[node.id]
+                    pool_to_use = await self.get_pool_for_node(node)
 
                 elif parsed_error.reply == "TRYAGAIN":
                     if ttl < self.REQUEST_TTL / 2:
@@ -751,7 +770,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             pool = None
         else:
             node = self.get_node(command, *args, **kwargs)
-            pool = self._cluster_pool[node.id]
+            pool = await self.get_pool_for_node(node)
         return await self._execute_node(
             pool,
             command,

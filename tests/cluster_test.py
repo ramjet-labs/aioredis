@@ -1372,6 +1372,15 @@ async def test_reload_cluster_pool(test_pool_cluster):
 
 @cluster_test
 @pytest.mark.run_loop
+async def test_get_pool_for_node_new_pool(test_pool_cluster):
+    prev_pool_len = len(test_pool_cluster._cluster_pool)
+    slave_node = test_pool_cluster.slave_nodes[0]
+    await test_pool_cluster.get_pool_for_node(slave_node)
+    assert len(test_pool_cluster._cluster_pool) == prev_pool_len + 1
+
+
+@cluster_test
+@pytest.mark.run_loop
 async def test_pool_conn_context_given_node(loop, test_pool_cluster, free_ports):
     expected_connection = FakeConnection(free_ports[0], loop)
     with PoolConnectionMock(
