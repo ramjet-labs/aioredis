@@ -284,12 +284,19 @@ DESIRE_START_PORT = 7000
 
 
 class FakeConnection:
-    def __init__(self, port, loop, return_value=b'OK', encoding='utf-8'):
+    def __init__(self,
+                 port,
+                 loop,
+                 return_value=b'OK',
+                 side_effect=None,
+                 encoding='utf-8'):
         self.port = port
         self.was_used = False
         self.encoding = encoding
         self.return_value = return_value
+        self.side_effect = side_effect
         self.loop = loop
+        self.closed = False
 
     def close(self):
         pass
@@ -299,13 +306,36 @@ class FakeConnection:
         pass
 
     def __getattr__(self, item):
-        future = asyncio.Future(loop=self.loop)
-        if isinstance(self.return_value, Exception):
-            future.set_exception(self.return_value)
-        else:
-            future.set_result(self.return_value)
+        # side_effect takes precedence over return_value
+        if self.side_effect is None:
+            future = asyncio.Future(loop=self.loop)
+            if isinstance(self.return_value, Exception):
+                future.set_exception(self.return_value)
+            else:
+                future.set_result(self.return_value)
 
-        result = mock.Mock(return_value=future)
+            result = mock.Mock(return_value=future)
+        else:
+            if isinstance(self.side_effect, Exception):
+                future = asyncio.Future(loop=self.loop)
+                future.set_exception(self.side_effect)
+                result = mock.Mock(return_value=future)
+            elif isinstance(self.side_effect, list):
+                futures = []
+                for res in self.side_effect:
+                    future = asyncio.Future(loop=self.loop)
+                    if isinstance(res, Exception):
+                        future.set_exception(res)
+                    else:
+                        future.set_result(res)
+                    futures.append(future)
+                result = mock.Mock(side_effect=futures)
+            elif callable(self.side_effect):
+                result = mock.Mock(side_effect=self.side_effect)
+            else:
+                future = asyncio.Future(loop=self.loop)
+                future.set_result(self.side_effect)
+                result = mock.Mock(return_value=future)
         setattr(self, item, result)
         return result
 
