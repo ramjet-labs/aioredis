@@ -455,13 +455,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
             while ttl > 0:
                 ttl -= 1
                 try:
-                    if asking:
-                        if address in connections:
-                            conn = connections[address]
-                        else:
-                            conn = await self.create_connection(address)
-                            connections[address] = conn
-                    elif try_random_node:
+                    if try_random_node:
                         node = self._cluster_manager.get_random_master_node()
                         if node.address in connections:
                             conn = connections[node.address]
@@ -593,9 +587,6 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
         self._maxsize = maxsize
         self._cluster_pool = {}
 
-    def _get_nodes_entities(self, **kwargs):
-        return self._cluster_pool.values()
-
     async def get_cluster_pool(self):
         cluster_pool = {}
         nodes = list(self._cluster_manager.masters)
@@ -668,10 +659,9 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
         return ClusterConnectionContext(pool)
 
     async def _execute_node(self,
-                            pool,
+                            address,
                             command,
                             *args,
-                            address=None,
                             asking=False,
                             **kwargs):
         """Execute redis command and returns Future waiting for the answer.
@@ -686,22 +676,26 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
         """
         cmd = decode(command, 'utf-8').lower()
         try_random_node = False
+        avoid_address = None
         ttl = int(self.REQUEST_TTL)
-        pool_to_use = pool
 
         while ttl > 0:
             ttl -= 1
 
             try:
-                if asking or pool is None:
-                    node = self._cluster_manager.get_node_by_address(address)
-                    pool_to_use = await self.get_pool_for_node(node)
-                elif try_random_node:
+                if try_random_node:
                     node = self._cluster_manager.get_random_master_node()
-                    pool_to_use = await self.get_pool_for_node(node)
+                    count = 3
+                    while node.address == avoid_address and count > 0:
+                        node = self._cluster_manager.get_random_master_node()
+                        count -= 1
                     try_random_node = False
+                    avoid_address = None
+                else:
+                    node = self._cluster_manager.get_node_by_address(address)
+                pool = await self.get_pool_for_node(node)
 
-                with await pool_to_use as conn:
+                with await pool as conn:
                     if asking:
                         await conn.execute(b"ASKING")
                         asking = False
@@ -709,6 +703,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                     return await getattr(conn, cmd)(*args, **kwargs)
             except (ConnectionError, asyncio.TimeoutError):
                 try_random_node = True
+                avoid_address = address
                 if ttl < self.REQUEST_TTL / 2:
                     await asyncio.sleep(0.1)
             except ReplyError as err:
@@ -728,8 +723,6 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                         slot = self.get_slot(command, *args, **kwargs)
                         self._cluster_manager.slots[slot][0] = node
                     await self.increment_moved_count()
-                    node = self._cluster_manager.get_node_by_address(address)
-                    pool_to_use = await self.get_pool_for_node(node)
 
                 elif parsed_error.reply == "TRYAGAIN":
                     if ttl < self.REQUEST_TTL / 2:
@@ -766,16 +759,13 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                 if self._refresh_nodes_asap:
                     await self.initialize()
 
-        if address:
-            pool = None
-        else:
+        if address is None:
             node = self.get_node(command, *args, **kwargs)
-            pool = await self.get_pool_for_node(node)
+            address = node.address
         return await self._execute_node(
-            pool,
+            address,
             command,
             *args,
-            address=address,
             **kwargs,
         )
 

@@ -389,7 +389,7 @@ class PoolConnectionMock:
                 'No connection expected for port {}.'.format(port)
             )
 
-        for pool in cluster._get_nodes_entities():
+        for pool in cluster._cluster_pool.values():
             port = pool.address[1]
             if port in self.connections:
                 create_future = functools.partial(
