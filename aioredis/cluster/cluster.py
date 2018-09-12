@@ -693,6 +693,11 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                     avoid_address = None
                 else:
                     node = self._cluster_manager.get_node_by_address(address)
+                    if node is None:
+                        await self.initialize_asap()
+                        node = self._cluster_manager.get_node_by_address(
+                            address
+                        )
                 pool = await self.get_pool_for_node(node)
 
                 with await pool as conn:
