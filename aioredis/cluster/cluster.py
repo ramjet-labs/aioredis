@@ -11,7 +11,7 @@ from aioredis.util import cached_property, decode, encode_str
 from .base import RedisClusterBase
 from .crc import crc16
 from .transaction import ClusterTransactionsMixin
-from .util import parse_cluster_response_error
+from .util import CONNECTION_ERRORS, parse_cluster_response_error
 
 __all__ = (
     'create_pool_cluster',
@@ -475,7 +475,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
                         asking = False
 
                     return await getattr(conn, cmd)(*args, **kwargs)
-                except (ConnectionError, asyncio.TimeoutError):
+                except CONNECTION_ERRORS:
                     try_random_node = True
                     if ttl < self.REQUEST_TTL / 2:
                         await asyncio.sleep(0.1)
@@ -706,7 +706,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                         asking = False
 
                     return await getattr(conn, cmd)(*args, **kwargs)
-            except (ConnectionError, asyncio.TimeoutError):
+            except CONNECTION_ERRORS:
                 try_random_node = True
                 avoid_address = address
                 if ttl < self.REQUEST_TTL / 2:

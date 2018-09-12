@@ -1,8 +1,18 @@
+import asyncio
 import collections
+
+from ..errors import ConnectionClosedError
 
 KnownReplyError = collections.namedtuple(
     "KnownReplyError",
     ["reply", "args"],
+)
+
+
+CONNECTION_ERRORS = (
+    ConnectionError,
+    asyncio.TimeoutError,
+    ConnectionClosedError,
 )
 
 
