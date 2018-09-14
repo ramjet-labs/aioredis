@@ -422,6 +422,24 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
         )
         return conn
 
+    async def get_conn_context_for_address(self, address):
+        node = self._cluster_manager.get_node_by_address(
+            address
+        )
+        if node:
+            redis = await self.create_connection(node.address)
+            return ClusterConnectionContext(redis)
+        await self.initialize_asap()
+        node = self._cluster_manager.get_node_by_address(
+            address
+        )
+        if node is None:
+            raise RedisClusterError(
+                "Could not find node with address {}".format(address)
+            )
+        redis = await self.create_connection(node.address)
+        return ClusterConnectionContext(redis)
+
     async def get_conn_context_for_node(self, node):
         redis = await self.create_connection(node.address)
         return ClusterConnectionContext(redis)
@@ -434,6 +452,28 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
             )
         redis = await self.create_connection(node.address)
         return ClusterConnectionContext(redis)
+
+    async def update_node_for_slot(self, address, slot):
+        """
+        Updates the node responsible for a given slot. If no known node exists
+        with the given address, then an initialization is queued to get an
+        up-to-date topology.
+        """
+        node = self._cluster_manager.get_node_by_address(
+            address
+        )
+        if node:
+            self._cluster_manager.slots[slot][0] = node
+        else:
+            await self.initialize_asap()
+            node = self._cluster_manager.get_node_by_address(
+                address
+            )
+            if node is None:
+                raise RedisClusterError(
+                    "Could not find node with address {}".format(address)
+                )
+            self._cluster_manager.slots[slot][0] = node
 
     async def _execute_node(self, address, command, *args, asking=False, **kwargs):
         """Execute redis command and returns Future waiting for the answer.
@@ -644,6 +684,24 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
         for pool in self._cluster_pool.values():
             pool.close()
             await pool.wait_closed()
+
+    async def get_conn_context_for_address(self, address):
+        node = self._cluster_manager.get_node_by_address(
+            address
+        )
+        if node:
+            pool = await self.get_pool_for_node(node)
+            return ClusterConnectionContext(pool)
+        await self.initialize_asap()
+        node = self._cluster_manager.get_node_by_address(
+            address
+        )
+        if node is None:
+            raise RedisClusterError(
+                "Could not find node with address {}".format(address)
+            )
+        pool = await self.get_pool_for_node(node)
+        return ClusterConnectionContext(pool)
 
     async def get_conn_context_for_node(self, node):
         pool = await self.get_pool_for_node(node)
