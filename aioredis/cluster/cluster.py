@@ -334,6 +334,19 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
     def slave_nodes(self):
         return self._cluster_manager.slaves
 
+    async def increment_moved_count(self):
+        self._moved_count += 1
+        if self._moved_count >= self.MAX_MOVED_COUNT:
+            async with self._initalize_lock:
+                if self._moved_count >= self.MAX_MOVED_COUNT:
+                    await self.initialize()
+
+    async def initialize_asap(self):
+        self._refresh_nodes_asap = True
+        async with self._initalize_lock:
+            if self._refresh_nodes_asap:
+                await self.initialize()
+
     async def _get_raw_cluster_info_from_node(self, node):
         conn = await create_redis(
             node,
@@ -387,6 +400,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
     async def initialize(self):
         logger.debug('Initializing cluster...')
         self._moved_count = 0
+        self._refresh_nodes_asap = False
         await self.fetch_cluster_info()
         logger.debug('Initialized cluster.\n%s', self._cluster_manager)
 
@@ -487,13 +501,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
                         if node:
                             slot = self.get_slot(command, *args, **kwargs)
                             self._cluster_manager.slots[slot][0] = node
-                        self._moved_count += 1
-                        if self._moved_count >= self.MAX_MOVED_COUNT:
-                            async with self._initalize_lock:
-                                if self._moved_count >= self.MAX_MOVED_COUNT:
-                                    await self.initialize()
-                            node = self.get_node(command, *args, *kwargs)
-                            address = node.address
+                        await self.increment_moved_count()
                     elif parsed_error.reply == "TRYAGAIN":
                         if ttl < self.REQUEST_TTL / 2:
                             await asyncio.sleep(0.05)
@@ -559,7 +567,6 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
             async with self._initalize_lock:
                 if self._refresh_nodes_asap:
                     await self.initialize()
-                    self._refresh_nodes_asap = False
         if not address:
             address = self.get_node(command, *args, **kwargs).address
 
@@ -701,16 +708,9 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                     if node:
                         slot = self.get_slot(command, *args, **kwargs)
                         self._cluster_manager.slots[slot][0] = node
-                    self._moved_count += 1
-                    if self._moved_count >= self.MAX_MOVED_COUNT:
-                        async with self._initalize_lock:
-                            if self._moved_count >= self.MAX_MOVED_COUNT:
-                                await self.initialize()
-                        node = self.get_node(command, *args, *kwargs)
-                        pool_to_use = self._cluster_pool[node.id]
-                    else:
-                        node = self._cluster_manager.get_node_by_address(address)
-                        pool_to_use = self._cluster_pool[node.id]
+                    await self.increment_moved_count()
+                    node = self._cluster_manager.get_node_by_address(address)
+                    pool_to_use = self._cluster_pool[node.id]
 
                 elif parsed_error.reply == "TRYAGAIN":
                     if ttl < self.REQUEST_TTL / 2:
@@ -746,7 +746,6 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             async with self._initalize_lock:
                 if self._refresh_nodes_asap:
                     await self.initialize()
-                    self._refresh_nodes_asap = False
 
         if address:
             pool = None
