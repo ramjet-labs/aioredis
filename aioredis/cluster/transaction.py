@@ -478,7 +478,7 @@ class ClusterMultiExec(ClusterPipeline):
             try:
                 # The coro will have already been executed if we didn't watch
                 # any keys.
-                if await self._coro(self._cluster, self) is False:
+                if await self._coro(conn, self) is False:
                     await conn.unwatch()
                     return []
             except:
