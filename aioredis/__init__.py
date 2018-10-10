@@ -29,7 +29,7 @@ from .errors import (
     )
 
 
-__version__ = '1.1.0-brilliant'
+__version__ = '1.1.0-brilliant.1'
 
 __all__ = [
     # Factories

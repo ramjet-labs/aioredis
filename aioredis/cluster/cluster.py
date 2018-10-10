@@ -446,7 +446,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
 
     async def get_conn_context_for_slot(self, slot):
         node = self._cluster_manager.get_node_by_slot(slot)
-        if not node or not node.is_master:
+        if not node:
             raise RedisClusterError(
                 "No master available for slot {}!".format(slot)
             )
@@ -709,7 +709,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
 
     async def get_conn_context_for_slot(self, slot):
         node = self._cluster_manager.get_node_by_slot(slot)
-        if not node or not node.is_master:
+        if not node:
             raise RedisClusterError(
                 "No master available for slot {}!".format(slot)
             )
