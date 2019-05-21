@@ -19,6 +19,7 @@ from aioredis.commands.cluster import (parse_cluster_nodes,
                                        parse_cluster_slots)
 from aioredis.errors import MultiExecError, PipelineError, RedisClusterError
 from aioredis.util import _NOTSET
+from _testutils import redis_version
 
 RAW_SLAVE_INFO_DATA = b"""\
 824fe116063bc5fcf9f4ffd895bc17aee7731ac3 127.0.0.1:30006 slave \
@@ -544,7 +545,7 @@ async def _wait_result(func, attempts=60, sleep_time=0.5, **kwargs):
     assert False
 
 
-cluster_test = pytest.redis_version(
+cluster_test = redis_version(
     3, 0, 0, reason='Cluster support was added in version 3')
 
 
