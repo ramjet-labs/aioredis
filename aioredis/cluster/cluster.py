@@ -205,7 +205,8 @@ class ClusterNodesManager:
 
 async def create_pool_cluster(
         nodes, *, db=0, password=None, encoding=None,
-        minsize=10, maxsize=10, commands_factory=Redis, loop=None):
+        minsize=10, maxsize=10, commands_factory=Redis, loop=None,
+        timeout=None):
     """
     Create Redis Pool Cluster.
 
@@ -217,6 +218,7 @@ async def create_pool_cluster(
     :param maxsize: int
     :param commands_factory: obj
     :param loop: obj
+    :param timeout: int
     :return RedisPoolCluster instance.
     """
     if not nodes or not isinstance(nodes, (tuple, list)):
@@ -226,7 +228,8 @@ async def create_pool_cluster(
 
     cluster = RedisPoolCluster(
         nodes, db, password, encoding=encoding, minsize=minsize,
-        maxsize=maxsize, commands_factory=commands_factory, loop=loop)
+        maxsize=maxsize, commands_factory=commands_factory, loop=loop,
+        timeout=timeout)
     await cluster.initialize()
     return cluster
 
@@ -619,7 +622,8 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
     """
 
     def __init__(self, nodes, db=0, password=None, encoding=None,
-                 *, minsize, maxsize, commands_factory, loop=None):
+                 *, minsize, maxsize, commands_factory, loop=None,
+                 timeout=None):
         if loop is None:
             loop = asyncio.get_event_loop()
         super().__init__(nodes, db=db, password=password, encoding=encoding,
@@ -627,6 +631,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
         self._minsize = minsize
         self._maxsize = maxsize
         self._cluster_pool = {}
+        self._connection_timeout = timeout
 
     async def get_cluster_pool(self):
         cluster_pool = {}
@@ -640,7 +645,8 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                 minsize=self._minsize,
                 maxsize=self._maxsize,
                 commands_factory=self._factory,
-                loop=self._loop
+                loop=self._loop,
+                timeout=self._connection_timeout,
             )
             for node in nodes
         ]
@@ -663,6 +669,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             maxsize=self._maxsize,
             commands_factory=self._factory,
             loop=self._loop,
+            timeout=self._connection_timeout,
         )
         self._cluster_pool[node.id] = connection
         return connection
