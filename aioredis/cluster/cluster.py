@@ -519,6 +519,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
                     try_random_node = True
                     if ttl < self.REQUEST_TTL / 2:
                         await asyncio.sleep(0.1)
+                    self._refresh_nodes_asap = True
                 except ReplyError as err:
                     parsed_error = parse_cluster_response_error(err)
                     if parsed_error is None:
@@ -769,6 +770,7 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                 avoid_address = address
                 if ttl < self.REQUEST_TTL / 2:
                     await asyncio.sleep(0.1)
+                self._refresh_nodes_asap = True
             except ReplyError as err:
                 parsed_error = parse_cluster_response_error(err)
                 if parsed_error is None:
