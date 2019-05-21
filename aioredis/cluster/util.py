@@ -13,6 +13,8 @@ CONNECTION_ERRORS = (
     ConnectionError,
     asyncio.TimeoutError,
     ConnectionClosedError,
+    OSError,
+    TimeoutError,
 )
 
 
