@@ -2690,7 +2690,7 @@ async def test_transaction_raises_error_from_transaction(loop,
         mock.call(b"SET", second_key, "2"),
         mock.call("EXEC"),
     ])
-    assert "ReplyError('UH OH',)" in str(e)
+    assert "ReplyError('UH OH')" in str(e)
 
 
 @cluster_test
