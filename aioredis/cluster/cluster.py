@@ -91,7 +91,11 @@ class ClusterNodesManager:
                 for slot_rng in node.slots:
                     for slot in range(slot_rng[0], slot_rng[1] + 1):
                         if slot in self.slots:
-                            self.slots[slot].insert(0, node)
+                            # Prefer the node that is alive.
+                            if node.is_alive:
+                                self.slots[slot].insert(0, node)
+                            else:
+                                self.slots[slot].insert(1, node)
                         else:
                             self.slots[slot] = [node]
         self.nodes = nodes
@@ -184,8 +188,13 @@ class ClusterNodesManager:
     def get_random_node(self):
         return random.choice(self.alive_nodes)
 
-    def get_random_master_node(self):
-        return random.choice(self.masters)
+    def get_random_master_node(self, ignore_address=None):
+        if ignore_address:
+            masters = [node for node in self.masters
+                       if node.address != ignore_address]
+        else:
+            masters = self.masters
+        return random.choice(masters)
 
     def get_random_slave_node(self):
         return random.choice(self.slaves)
@@ -753,7 +762,9 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                     node = self._cluster_manager.get_random_master_node()
                     count = 3
                     while node.address == avoid_address and count > 0:
-                        node = self._cluster_manager.get_random_master_node()
+                        node = self._cluster_manager.get_random_master_node(
+                            ignore_address=avoid_address,
+                        )
                         count -= 1
                     try_random_node = False
                     avoid_address = None
