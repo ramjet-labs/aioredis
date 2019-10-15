@@ -8,19 +8,18 @@ addons:
 
 env:
   global:
-    REDIS_TAGS: >-
-      '2.6.17 2.8.22 3.0.7 3.2.8 4.0.11 5.0.1'
     INSTALL_DIR: >-
       $HOME/redis
     PYTEST_ADDOPTS: >-
-      '-n auto'
+      "-n $(( $(nproc) * 2 ))"
 
 python:
 - "3.5"
 - "3.6"
 - "3.7"
 - "nightly"
-- "pypy3.5-6.0"
+- "pypy3.5-7.0"
+- "pypy3.6-7.1.1"
 
 stages:
 - lint
@@ -65,24 +64,23 @@ jobs:
     cache: false
     python: "3.6"
     install:
-    - pip install -r tests/requirements.txt
+    - pip install -r tests/requirements.txt -r tests/requirements-mypy.txt
     script:
     - make mypy
   - <<: *MYPY
     python: "3.7"
-  # Run examples Python 3.6, 3.7 and system Redis
+  # Run examples
   - &EXAMPLES
     stage: examples
     cache: false
-    python: 3.6
+    python: 3.7
     install:
     - pip install -e. -c tests/requirements.txt
     script:
     - make examples
-  - <<: *EXAMPLES
-    python: "3.7"
 
 install:
+- make ci-prune-old-redis
 - make -j ci-build-redis
 - |
     if [ "$UVLOOP" = "y" ]; then
@@ -101,4 +99,4 @@ cache:
   - $HOME/redis/
 
 after_script:
-- codecov
+- codecov -f coverage.xml

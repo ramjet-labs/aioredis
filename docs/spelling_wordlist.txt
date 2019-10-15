@@ -17,6 +17,7 @@ bool
 brpop
 brpoplpush
 bugfix
+Bugfixes
 cardinality
 ClientInfo
 CPython
@@ -133,6 +134,7 @@ unsubscribe
 unsubscribed
 unsubscribing
 URI
+UTF
 util
 uvloop
 UVLoop
