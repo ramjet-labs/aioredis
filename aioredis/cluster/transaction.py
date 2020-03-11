@@ -3,7 +3,7 @@ import functools
 
 from ..errors import (ConnectionClosedError, MultiExecError, PipelineError,
                       RedisError, ReplyError)
-from ..util import _set_exception
+from ..util import _set_exception, get_event_loop
 from .util import parse_cluster_response_error
 
 
@@ -36,8 +36,7 @@ class ClusterTransactionsMixin(object):
         >>> result_check = await asyncio.gather(fut1, fut2)
         >>> assert result == result_check
         """
-        return ClusterPipeline(self, commands_factory=self._factory,
-                               loop=self._loop)
+        return ClusterPipeline(self, commands_factory=self._factory)
 
     async def transaction(self, coro, *watched_keys):
         """
@@ -77,19 +76,15 @@ class ClusterTransactionsMixin(object):
         multi_exec = ClusterMultiExec(cluster=self,
                                       watched_keys=watched_keys,
                                       coro=coro,
-                                      commands_factory=self._factory,
-                                      loop=self._loop)
+                                      commands_factory=self._factory)
         return await multi_exec.execute()
 
 
 class _RedisBuffer(object):
 
-    def __init__(self, pipeline, cluster, *, loop=None, force_same_slot=False):
-        if loop is None:
-            loop = asyncio.get_event_loop()
+    def __init__(self, pipeline, cluster, *, force_same_slot=False):
         self._pipeline = pipeline
         self._cluster = cluster
-        self._loop = loop
         self._force_same_slot = force_same_slot
         self.node = None
         self.slot = None
@@ -112,7 +107,7 @@ class _RedisBuffer(object):
                     "All keys in pipeline must point to same node!"
                 )
 
-        fut = self._loop.create_future()
+        fut = get_event_loop().create_future()
         self._pipeline.append((fut, cmd, args, kwargs))
         return fut
 
@@ -129,15 +124,11 @@ class ClusterPipeline(object):
 
     error_class = PipelineError
 
-    def __init__(self, cluster, commands_factory=lambda cluster: cluster,
-                 *, loop=None):
-        if loop is None:
-            loop = asyncio.get_event_loop()
+    def __init__(self, cluster, commands_factory=lambda cluster: cluster):
         self._cluster = cluster
-        self._loop = loop
         self._pipeline = []
         self._results = []
-        self._buffer = _RedisBuffer(self._pipeline, cluster=cluster, loop=loop)
+        self._buffer = _RedisBuffer(self._pipeline, cluster=cluster)
         self._redis = commands_factory(self._buffer)
         self._done = False
         self._commands = []
@@ -151,8 +142,7 @@ class ClusterPipeline(object):
             def wrapper(*args, **kw):
                 try:
                     prev_pipeline_len = len(self._pipeline)
-                    task = asyncio.ensure_future(attr(*args, **kw),
-                                                 loop=self._loop)
+                    task = asyncio.ensure_future(attr(*args, **kw))
                 except InvalidPipelineOperation:
                     # If one step in the pipeline is invalid, we should cancel
                     # all the existing futures and exit.
@@ -160,7 +150,7 @@ class ClusterPipeline(object):
                     self._done = True
                     raise
                 except Exception as exc:
-                    task = self._loop.create_future()
+                    task = get_event_loop().create_future()
                     task.set_exception(exc)
                 # If we added a new command to the pipeline, let's store the
                 # actual command + args/kwargs in the results list as well (so
@@ -209,7 +199,6 @@ class ClusterPipeline(object):
 
     async def _do_execute(self, conn, *, return_exceptions=False):
         await asyncio.gather(*self._send_pipeline(conn),
-                             loop=self._loop,
                              return_exceptions=True)
         return await self._gather_result(return_exceptions)
 
@@ -297,9 +286,7 @@ class ClusterMultiExec(ClusterPipeline):
                  cluster,
                  watched_keys,
                  coro,
-                 commands_factory=lambda cluster: cluster,
-                 *,
-                 loop=None):
+                 commands_factory=lambda cluster: cluster):
         """
         Creates a transaction pipeline:
 
@@ -314,11 +301,10 @@ class ClusterMultiExec(ClusterPipeline):
             transaction will not execute. If all checks succeed, the function
             should return True.
         """
-        super().__init__(cluster, commands_factory=commands_factory, loop=loop)
+        super().__init__(cluster, commands_factory=commands_factory)
         self._buffer = _RedisBuffer(
             self._pipeline,
             cluster=cluster,
-            loop=loop,
             force_same_slot=True,
         )
         self._redis = commands_factory(self._buffer)
@@ -493,11 +479,10 @@ class ClusterMultiExec(ClusterPipeline):
 
         coros = list(self._send_pipeline(conn))
         exec_ = conn.execute("EXEC")
-        gather = asyncio.gather(multi, *coros, loop=self._loop,
-                                return_exceptions=True)
+        gather = asyncio.gather(multi, *coros, return_exceptions=True)
         last_error = None
         try:
-            await asyncio.shield(gather, loop=self._loop)
+            await asyncio.shield(gather)
         except asyncio.CancelledError:
             await gather
         except Exception as err:

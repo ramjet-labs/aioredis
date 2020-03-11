@@ -214,7 +214,7 @@ class ClusterNodesManager:
 
 async def create_pool_cluster(
         nodes, *, db=0, password=None, encoding=None,
-        minsize=10, maxsize=10, commands_factory=Redis, loop=None,
+        minsize=10, maxsize=10, commands_factory=Redis,
         timeout=None):
     """
     Create Redis Pool Cluster.
@@ -226,7 +226,6 @@ async def create_pool_cluster(
     :param minsize: int
     :param maxsize: int
     :param commands_factory: obj
-    :param loop: obj
     :param timeout: int
     :return RedisPoolCluster instance.
     """
@@ -237,7 +236,7 @@ async def create_pool_cluster(
 
     cluster = RedisPoolCluster(
         nodes, db, password, encoding=encoding, minsize=minsize,
-        maxsize=maxsize, commands_factory=commands_factory, loop=loop,
+        maxsize=maxsize, commands_factory=commands_factory,
         timeout=timeout)
     await cluster.initialize()
     return cluster
@@ -245,7 +244,7 @@ async def create_pool_cluster(
 
 async def create_cluster(
         nodes, *, db=0, password=None, encoding=None,
-        commands_factory=Redis, loop=None):
+        commands_factory=Redis):
     """
     Create Redis Pool Cluster.
 
@@ -254,7 +253,6 @@ async def create_cluster(
     :param password: str
     :param encoding: str
     :param commands_factory: obj
-    :param loop: obj
     :return RedisPoolCluster instance.
     """
     if not nodes or not isinstance(nodes, (tuple, list)):
@@ -264,7 +262,7 @@ async def create_cluster(
 
     cluster = RedisCluster(
         nodes, db, password, encoding=encoding,
-        commands_factory=commands_factory, loop=loop)
+        commands_factory=commands_factory)
     await cluster.initialize()
     return cluster
 
@@ -276,15 +274,12 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
     REQUEST_TTL = 16
 
     def __init__(self, nodes, db=0, password=None, encoding=None,
-                 *, commands_factory, loop=None):
-        if loop is None:
-            loop = asyncio.get_event_loop()
+                 *, commands_factory):
         self._nodes = nodes
         self._db = db
         self._password = password
         self._encoding = encoding
         self._factory = commands_factory
-        self._loop = loop
         self._moved_count = 0
         self._cluster_manager = None
         self._initalize_lock = asyncio.Lock()
@@ -366,7 +361,6 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
             password=self._password,
             encoding='utf-8',
             commands_factory=self._factory,
-            loop=self._loop
         )
 
         try:
@@ -380,11 +374,11 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
         logger.debug('Loading cluster info from %s...', self._nodes)
         tasks = [
             asyncio.ensure_future(
-                self._get_raw_cluster_info_from_node(node), loop=self._loop
+                self._get_raw_cluster_info_from_node(node)
             ) for node in self._nodes
         ]
         try:
-            for task in asyncio.as_completed(tasks, loop=self._loop):
+            for task in asyncio.as_completed(tasks):
                 try:
                     nodes_raw_response = list(await task)
                     self._cluster_manager = ClusterNodesManager.create(
@@ -404,7 +398,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
                 task.cancel()
             # Wait until all tasks have closed their connection
             await asyncio.gather(
-                *tasks, loop=self._loop, return_exceptions=True)
+                *tasks, return_exceptions=True)
 
         raise RedisClusterError(
             "No cluster info could be loaded from any host")
@@ -430,7 +424,6 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
             encoding=self._encoding,
             password=self._password,
             commands_factory=self._factory,
-            loop=self._loop,
         )
         return conn
 
@@ -584,7 +577,7 @@ class RedisCluster(RedisClusterBase, ClusterTransactionsMixin):
         return await asyncio.gather(*[
             self._execute_node(node, command, *args, **kwargs)
             for node in nodes
-        ], loop=self._loop)
+        ])
 
     async def execute(
             self, command, *args, address=None, many=False, slaves=False,
@@ -631,12 +624,10 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
     """
 
     def __init__(self, nodes, db=0, password=None, encoding=None,
-                 *, minsize, maxsize, commands_factory, loop=None,
+                 *, minsize, maxsize, commands_factory,
                  timeout=None):
-        if loop is None:
-            loop = asyncio.get_event_loop()
         super().__init__(nodes, db=db, password=password, encoding=encoding,
-                         commands_factory=commands_factory, loop=loop)
+                         commands_factory=commands_factory)
         self._minsize = minsize
         self._maxsize = maxsize
         self._cluster_pool = {}
@@ -654,12 +645,11 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
                 minsize=self._minsize,
                 maxsize=self._maxsize,
                 commands_factory=self._factory,
-                loop=self._loop,
                 timeout=self._connection_timeout,
             )
             for node in nodes
         ]
-        results = await asyncio.gather(*tasks, loop=self._loop)
+        results = await asyncio.gather(*tasks)
 
         for node, connection in zip(nodes, results):
             cluster_pool[node.id] = connection
@@ -677,7 +667,6 @@ class RedisPoolCluster(RedisCluster, ClusterTransactionsMixin):
             minsize=self._minsize,
             maxsize=self._maxsize,
             commands_factory=self._factory,
-            loop=self._loop,
             timeout=self._connection_timeout,
         )
         self._cluster_pool[node.id] = connection

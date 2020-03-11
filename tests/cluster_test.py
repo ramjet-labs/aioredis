@@ -488,7 +488,7 @@ def choice_mock():
 @pytest.fixture
 def test_cluster(loop, nodes, cluster_server):
     return loop.run_until_complete(
-        create_cluster(nodes, encoding='utf-8', loop=loop)
+        create_cluster(nodes, encoding='utf-8')
     )
 
 
@@ -496,14 +496,14 @@ def test_cluster(loop, nodes, cluster_server):
 def test_cluster_no_slots_assigned(
         loop, nodes, cluster_server_no_slots_assigned):
     return loop.run_until_complete(
-        create_cluster(nodes, encoding='utf-8', loop=loop)
+        create_cluster(nodes, encoding='utf-8')
     )
 
 
 @pytest.fixture
 def test_pool_cluster(loop, nodes, cluster_server):
     pool_cluster = loop.run_until_complete(
-        create_pool_cluster(nodes, encoding='utf-8', loop=loop)
+        create_pool_cluster(nodes, encoding='utf-8')
     )
 
     yield pool_cluster
@@ -709,7 +709,7 @@ async def test_create_fails(loop, nodes, free_ports):
 
     with CreateConnectionMock(expected_connections):
         with pytest.raises(RedisClusterError):
-            await create_cluster(nodes, encoding='utf-8', loop=loop)
+            await create_cluster(nodes, encoding='utf-8')
 
 
 @cluster_test
@@ -878,7 +878,7 @@ async def test_execute_with_tryagain_eventually_raises(loop, test_cluster, free_
 @cluster_test
 @pytest.mark.run_loop
 async def test_execute_with_clusterdown_raises_exception(loop, nodes, cluster_server, free_ports):
-    test_cluster = await create_cluster([nodes[0]], encoding='utf-8', loop=loop)
+    test_cluster = await create_cluster([nodes[0]], encoding='utf-8')
     expected_connections = {
         free_ports[0]: FakeConnection(
             free_ports[0],
@@ -1192,7 +1192,7 @@ async def test_pool_execute_with_clusterdown_raises_exception(
     cluster_server,
     free_ports,
 ):
-    test_cluster = await create_pool_cluster([nodes[0]], encoding='utf-8', loop=loop)
+    test_cluster = await create_pool_cluster([nodes[0]], encoding='utf-8')
     expected_pool_connection = FakeConnection(
         free_ports[0],
         loop,

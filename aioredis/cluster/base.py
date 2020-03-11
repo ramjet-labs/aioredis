@@ -44,7 +44,7 @@ class RedisClusterBase:
 
         result = await asyncio.gather(*[
             scan_coroutine(e, cur=cursor) for e in self._get_nodes_entities()
-        ], loop=self._loop)
+        ])
 
         flatten_result = []
         list(map(flatten_result.extend, result))
@@ -95,7 +95,7 @@ class RedisClusterBase:
         return await asyncio.gather(*[
             self._execute_node(n_address, 'cluster_del_slots', *n_slots)
             for n_address, n_slots in nodes.items()
-        ], loop=self._loop)
+        ])
 
     async def cluster_reset(self, *, hard=False, address=None):
         """Reset a Redis Cluster node. Or all nodes if address not provided"""
@@ -139,7 +139,7 @@ class RedisClusterBase:
         return await asyncio.gather(*[
             self._execute_node(add, 'cluster_forget', node_id)
             for add in nodes
-        ], loop=self._loop)
+        ])
 
     async def cluster_count_key_in_slots(self, slot):
         """Return the number of local keys in the specified hash slot."""
